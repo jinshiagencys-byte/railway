@@ -123,6 +123,7 @@ app.post('/create-monitor-group', async (req, res) => {
         name: groupName,
         interval: 60,
         retryInterval: 60,
+        accepted_statuscodes: ['200-299'],
         notificationIDList: {}
       }, (groupRes) => {
         if (!groupRes.ok) {
