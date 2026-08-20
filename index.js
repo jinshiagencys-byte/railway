@@ -122,7 +122,8 @@ app.post('/create-monitor-group', async (req, res) => {
         type: 'group',
         name: groupName,
         interval: 60,
-        retryInterval: 60
+        retryInterval: 60,
+        notificationIDList: {}
       }, (groupRes) => {
         if (!groupRes.ok) {
           socket.disconnect();
@@ -143,7 +144,8 @@ app.post('/create-monitor-group', async (req, res) => {
             retryInterval: 60,
             maxretries: 3,
             method: 'GET',
-            accepted_statuscodes: ['200-299']
+            accepted_statuscodes: ['200-299'],
+            notificationIDList: {}
           }, (childRes) => {
             remaining -= 1;
             if (childRes.ok) {
