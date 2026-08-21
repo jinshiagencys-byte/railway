@@ -4,6 +4,7 @@ const axios = require('axios');
 const { parseStringPromise } = require('xml2js');
 const cheerio = require('cheerio');
 const pushTokensRoutes = require('./src/routes/pushTokens');
+const { supabase } = require('./src/lib/supabaseClient');
 
 const app = express();
 app.use(express.json());
@@ -66,9 +67,27 @@ app.post('/create-monitor', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  const { name, url } = req.body;
+  const { name, url, assignee } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
+
   try {
+    // Enregistre aussi un site "simple" (sans scan) dans Supabase, pour garder
+    // une trace du client/responsable même en mode monitor unique.
+    const { data: siteRow, error: siteInsertError } = await supabase
+      .from('sites')
+      .insert({
+        client_name: name || url,
+        site_url: url,
+        assignee: assignee || null,
+        is_active: true,
+      })
+      .select()
+      .single();
+
+    if (siteInsertError) {
+      console.error('[create-monitor] Supabase site insert error:', siteInsertError);
+    }
+
     const result = await withKuma((socket, resolve, reject) => {
       socket.emit('add', {
         type: 'http',
@@ -78,13 +97,29 @@ app.post('/create-monitor', async (req, res) => {
         retryInterval: 60,
         maxretries: 3,
         method: 'GET',
-        accepted_statuscodes: ['200-299']
-      }, (addRes) => {
+        accepted_statuscodes: ['200-299'],
+        notificationIDList: {}
+      }, async (addRes) => {
         socket.disconnect();
         if (!addRes.ok) return reject(new Error(addRes.msg));
-        resolve(addRes);
+
+        const monitorId = addRes.monitorID ?? addRes.monitorId;
+
+        // Lie le monitor créé à la ligne "sites", si elle a bien été créée.
+        if (siteRow?.id) {
+          const { error: updateError } = await supabase
+            .from('sites')
+            .update({ kuma_group_id: monitorId })
+            .eq('id', siteRow.id);
+          if (updateError) {
+            console.error('[create-monitor] Supabase site update error:', updateError);
+          }
+        }
+
+        resolve({ ...addRes, monitorId });
       });
     });
+
     res.json({ success: true, monitorId: result.monitorId, msg: result.msg });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -113,60 +148,133 @@ app.post('/create-monitor-group', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  const { groupName, pages } = req.body; // pages: [{url, name}]
-  if (!groupName || !Array.isArray(pages) || pages.length === 0) {
-    return res.status(400).json({ error: 'groupName and pages[] are required' });
+
+  const { clientName, siteUrl, assignee, groupName, pages } = req.body;
+
+  if (!clientName || !siteUrl || !groupName || !Array.isArray(pages) || pages.length === 0) {
+    return res.status(400).json({
+      error: 'clientName, siteUrl, groupName et pages[] sont requis',
+    });
   }
 
+  // --- Étape 1 : créer la ligne "sites" dans Supabase ---
+  const { data: siteRow, error: siteInsertError } = await supabase
+    .from('sites')
+    .insert({
+      client_name: clientName,
+      site_url: siteUrl,
+      assignee: assignee || null,
+      is_active: true,
+    })
+    .select()
+    .single();
+
+  if (siteInsertError) {
+    console.error('[create-monitor-group] Supabase site insert error:', siteInsertError);
+    return res.status(500).json({ error: "Échec de l'enregistrement du site." });
+  }
+
+  const siteId = siteRow.id;
+
+  // --- Étape 2 : créer le groupe Kuma + les monitors enfants (push) ---
   try {
     const result = await withKuma((socket, resolve, reject) => {
-      socket.emit('add', {
-        type: 'group',
-        name: groupName,
-        interval: 60,
-        retryInterval: 60,
-        accepted_statuscodes: ['200-299'],
-        notificationIDList: {}
-      }, (groupRes) => {
-        if (!groupRes.ok) {
-          socket.disconnect();
-          return reject(new Error(groupRes.msg));
-        }
-        const groupId = groupRes.monitorID ?? groupRes.monitorId;
-        let remaining = pages.length;
-        const created = [];
-        const errors = [];
+      socket.emit(
+        'add',
+        {
+          type: 'group',
+          name: groupName,
+          interval: 60,
+          retryInterval: 60,
+          accepted_statuscodes: ['200-299'],
+          notificationIDList: {},
+        },
+        async (groupRes) => {
+          if (!groupRes.ok) {
+            socket.disconnect();
+            return reject(new Error(groupRes.msg));
+          }
 
-        pages.forEach((page) => {
-          socket.emit('add', {
-            type: 'http',
-            name: page.name || page.url,
-            url: page.url,
-            parent: groupId,
-            interval: 60,
-            retryInterval: 60,
-            maxretries: 3,
-            method: 'GET',
-            accepted_statuscodes: ['200-299'],
-            notificationIDList: {}
-          }, (childRes) => {
-            remaining -= 1;
-            if (childRes.ok) {
-              created.push(childRes.monitorID ?? childRes.monitorId);
-            } else {
-              errors.push({ url: page.url, msg: childRes.msg });
-            }
+          const groupId = groupRes.monitorID ?? groupRes.monitorId;
 
-            if (remaining === 0) {
-              socket.disconnect();
-              resolve({ groupId, created, errors });
-            }
+          // --- Étape 3 : lier kuma_group_id à la ligne "sites" ---
+          const { error: updateError } = await supabase
+            .from('sites')
+            .update({ kuma_group_id: groupId })
+            .eq('id', siteId);
+
+          if (updateError) {
+            console.error('[create-monitor-group] Supabase site update error:', updateError);
+          }
+
+          let remaining = pages.length;
+          const created = [];
+          const errors = [];
+          const pushTokenRows = [];
+
+          pages.forEach((page) => {
+            socket.emit(
+              'add',
+              {
+                type: 'push', // push au lieu de http, pour écouter Playwright
+                name: page.name || page.url,
+                parent: groupId,
+                interval: 60,
+                accepted_statuscodes: ['200-299'],
+                notificationIDList: {},
+              },
+              (childRes) => {
+                remaining -= 1;
+
+                // Décommente cette ligne UNE FOIS pour confirmer le nom exact du champ token,
+                // puis re-commente après vérification :
+                // console.log('[create-monitor-group] childRes:', JSON.stringify(childRes));
+
+                if (childRes.ok) {
+                  const monitorId = childRes.monitorID ?? childRes.monitorId;
+                  created.push(monitorId);
+                  pushTokenRows.push({
+                    group_id: groupId,
+                    monitor_id: monitorId,
+                    url: page.url,
+                    name: page.name || page.url,
+                    push_token: childRes.pushToken, // ⚠️ à confirmer via le log ci-dessus
+                    site_id: siteId,
+                  });
+                } else {
+                  errors.push({ url: page.url, msg: childRes.msg });
+                }
+
+                if (remaining === 0) {
+                  socket.disconnect();
+                  resolve({ groupId, created, errors, pushTokenRows });
+                }
+              }
+            );
           });
-        });
-      });
+        }
+      );
     });
 
-    res.json({ success: true, ...result });
+    // --- Étape 4 : enregistrer les push_tokens dans Supabase ---
+    if (result.pushTokenRows.length > 0) {
+      const { error: insertTokensError } = await supabase
+        .from('push_tokens')
+        .insert(result.pushTokenRows);
+
+      if (insertTokensError) {
+        console.error('[create-monitor-group] Supabase push_tokens insert error:', insertTokensError);
+        result.errors.push({ url: 'supabase', msg: 'Échec enregistrement des tokens push.' });
+      }
+    }
+
+    res.json({
+      success: true,
+      siteId,
+      groupId: result.groupId,
+      created: result.created,
+      errors: result.errors,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
