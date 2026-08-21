@@ -224,29 +224,46 @@ app.post('/create-monitor-group', async (req, res) => {
                 notificationIDList: {},
               },
               (childRes) => {
-                remaining -= 1;
-
-                console.log('[create-monitor-group] childRes:', JSON.stringify(childRes));
-
-                if (childRes.ok) {
-                  const monitorId = childRes.monitorID ?? childRes.monitorId;
-                  created.push(monitorId);
-                  pushTokenRows.push({
-                    group_id: groupId,
-                    monitor_id: monitorId,
-                    url: page.url,
-                    name: page.name || page.url,
-                    push_token: childRes.pushToken, // ⚠️ à confirmer via le log ci-dessus
-                    site_id: siteId,
-                  });
-                } else {
+                if (!childRes.ok) {
+                  remaining -= 1;
                   errors.push({ url: page.url, msg: childRes.msg });
+                  if (remaining === 0) {
+                    socket.disconnect();
+                    resolve({ groupId, created, errors, pushTokenRows });
+                  }
+                  return;
                 }
 
-                if (remaining === 0) {
-                  socket.disconnect();
-                  resolve({ groupId, created, errors, pushTokenRows });
-                }
+                const monitorId = childRes.monitorID ?? childRes.monitorId;
+                created.push(monitorId);
+
+                // Le callback 'add' ne renvoie jamais le pushToken, même pour
+                // un monitor de type push. Il faut le récupérer séparément
+                // via 'getMonitor', qui renvoie l'objet complet du monitor.
+                socket.emit('getMonitor', monitorId, (monitorRes) => {
+                  remaining -= 1;
+
+                  console.log('[create-monitor-group] getMonitor result:', JSON.stringify(monitorRes));
+
+                  const token = monitorRes?.monitor?.pushToken;
+                  if (monitorRes?.ok && token) {
+                    pushTokenRows.push({
+                      group_id: groupId,
+                      monitor_id: monitorId,
+                      url: page.url,
+                      name: page.name || page.url,
+                      push_token: token,
+                      site_id: siteId,
+                    });
+                  } else {
+                    errors.push({ url: page.url, msg: 'pushToken introuvable via getMonitor' });
+                  }
+
+                  if (remaining === 0) {
+                    socket.disconnect();
+                    resolve({ groupId, created, errors, pushTokenRows });
+                  }
+                });
               }
             );
           });
