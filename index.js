@@ -226,9 +226,7 @@ app.post('/create-monitor-group', async (req, res) => {
               (childRes) => {
                 remaining -= 1;
 
-                // Décommente cette ligne UNE FOIS pour confirmer le nom exact du champ token,
-                // puis re-commente après vérification :
-                // console.log('[create-monitor-group] childRes:', JSON.stringify(childRes));
+                console.log('[create-monitor-group] childRes:', JSON.stringify(childRes));
 
                 if (childRes.ok) {
                   const monitorId = childRes.monitorID ?? childRes.monitorId;
