@@ -1,10 +1,27 @@
 const express = require('express');
 const io = require('socket.io-client');
 const axios = require('axios');
+const crypto = require('crypto');
 const { parseStringPromise } = require('xml2js');
 const cheerio = require('cheerio');
 const pushTokensRoutes = require('./src/routes/pushTokens');
 const { supabase } = require('./src/lib/supabaseClient');
+
+// Kuma ne génère PAS le pushToken côté serveur pour un monitor de type
+// "push" — c'est le frontend Vue qui le génère (genSecret()) puis l'envoie
+// DANS le payload `add`. Si on ne le fournit pas, le champ reste `null`
+// dans Kuma (confirmé par test réel : getMonitor renvoyait pushToken: null).
+// Fix : on le génère nous-mêmes ici et on l'injecte dans le payload `add`,
+// ce qui rend l'appel `getMonitor` a posteriori totalement inutile.
+function genPushToken(length = 32) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.randomBytes(length);
+  let token = '';
+  for (let i = 0; i < length; i++) {
+    token += chars[bytes[i] % chars.length];
+  }
+  return token;
+}
 
 const app = express();
 app.use(express.json());
@@ -213,6 +230,11 @@ app.post('/create-monitor-group', async (req, res) => {
           const pushTokenRows = [];
 
           pages.forEach((page) => {
+            // Fix : le token est généré ICI, avant le `add`, et fourni
+            // directement dans le payload. Kuma le stocke tel quel — plus
+            // besoin d'aller le redemander après coup via getMonitor.
+            const pushToken = genPushToken();
+
             socket.emit(
               'add',
               {
@@ -222,10 +244,12 @@ app.post('/create-monitor-group', async (req, res) => {
                 interval: 60,
                 accepted_statuscodes: ['200-299'],
                 notificationIDList: {},
+                pushToken, // <-- clé du fix
               },
               (childRes) => {
+                remaining -= 1;
+
                 if (!childRes.ok) {
-                  remaining -= 1;
                   errors.push({ url: page.url, msg: childRes.msg });
                   if (remaining === 0) {
                     socket.disconnect();
@@ -237,33 +261,19 @@ app.post('/create-monitor-group', async (req, res) => {
                 const monitorId = childRes.monitorID ?? childRes.monitorId;
                 created.push(monitorId);
 
-                // Le callback 'add' ne renvoie jamais le pushToken, même pour
-                // un monitor de type push. Il faut le récupérer séparément
-                // via 'getMonitor', qui renvoie l'objet complet du monitor.
-                socket.emit('getMonitor', monitorId, (monitorRes) => {
-                  remaining -= 1;
-
-                  console.log('[create-monitor-group] getMonitor result:', JSON.stringify(monitorRes));
-
-                  const token = monitorRes?.monitor?.pushToken;
-                  if (monitorRes?.ok && token) {
-                    pushTokenRows.push({
-                      group_id: groupId,
-                      monitor_id: monitorId,
-                      url: page.url,
-                      name: page.name || page.url,
-                      push_token: token,
-                      site_id: siteId,
-                    });
-                  } else {
-                    errors.push({ url: page.url, msg: 'pushToken introuvable via getMonitor' });
-                  }
-
-                  if (remaining === 0) {
-                    socket.disconnect();
-                    resolve({ groupId, created, errors, pushTokenRows });
-                  }
+                pushTokenRows.push({
+                  group_id: groupId,
+                  monitor_id: monitorId,
+                  url: page.url,
+                  name: page.name || page.url,
+                  push_token: pushToken,
+                  site_id: siteId,
                 });
+
+                if (remaining === 0) {
+                  socket.disconnect();
+                  resolve({ groupId, created, errors, pushTokenRows });
+                }
               }
             );
           });
