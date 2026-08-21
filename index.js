@@ -3,9 +3,11 @@ const io = require('socket.io-client');
 const axios = require('axios');
 const { parseStringPromise } = require('xml2js');
 const cheerio = require('cheerio');
+const pushTokensRoutes = require('./src/routes/pushTokens');
 
 const app = express();
 app.use(express.json());
+app.use(pushTokensRoutes);
 
 const KUMA_URL = process.env.KUMA_URL; // ex: https://louislamuptime-kuma-production-ff0b.up.railway.app
 const KUMA_USER = process.env.KUMA_USER;
