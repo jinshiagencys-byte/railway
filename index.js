@@ -4,6 +4,8 @@ const http = require('http');
 const { Server: SocketIOServer } = require('socket.io'); // serveur : app mobile -> relay (temps réel)
 const axios = require('axios');
 const crypto = require('crypto');
+const tls = require('tls');
+const { URL } = require('url');
 const { parseStringPromise } = require('xml2js');
 const cheerio = require('cheerio');
 const pushTokensRoutes = require('./src/routes/pushTokens');
@@ -531,6 +533,69 @@ app.get('/monitors', async (req, res) => {
   }
 });
 
+// --- Certificat TLS réel (remplace les valeurs codées en dur "47 days") ---
+//
+// Pour un monitor HTTP simple, l'URL est directement dans m.url. Pour un
+// monitor "push" (créé via un scan de pages, cas le plus courant ici), Kuma
+// ne stocke aucune URL — elle vit uniquement dans Supabase (push_tokens.url).
+// On regarde d'abord m.url, sinon on va la chercher par monitor_id.
+async function resolveMonitorUrl(id, m) {
+  if (m.url) return m.url;
+  try {
+    const { data } = await supabase
+      .from('push_tokens')
+      .select('url')
+      .eq('monitor_id', Number(id))
+      .maybeSingle();
+    return data?.url ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Ouvre une connexion TLS brute (sans passer par http/axios) pour lire le
+// certificat présenté par le serveur et calculer les jours restants avant
+// expiration. Timeout court pour ne jamais bloquer la route /monitors/:id.
+function getTlsExpiry(siteUrl) {
+  return new Promise((resolve) => {
+    let hostname;
+    try {
+      hostname = new URL(siteUrl).hostname;
+    } catch {
+      return resolve(null);
+    }
+
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    const socket = tls.connect(
+      { host: hostname, port: 443, servername: hostname, timeout: 5000 },
+      () => {
+        const cert = socket.getPeerCertificate();
+        socket.end();
+        if (!cert || !cert.valid_to) return finish(null);
+        const validTo = new Date(cert.valid_to);
+        const daysRemaining = Math.ceil((validTo.getTime() - Date.now()) / 86400000);
+        finish({
+          daysRemaining,
+          validTo: validTo.toISOString().slice(0, 10),
+          issuer: cert.issuer?.O || cert.issuer?.CN || null,
+        });
+      }
+    );
+
+    socket.on('error', () => finish(null));
+    socket.on('timeout', () => {
+      socket.destroy();
+      finish(null);
+    });
+  });
+}
+
 // --- GET /monitors/:id : détail complet pour l'écran de détail de l'app ---
 app.get('/monitors/:id', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
@@ -568,13 +633,20 @@ app.get('/monitors/:id', async (req, res) => {
       msg: h.msg ?? null,
     }));
 
+    // Certificat TLS réel du site (remplace les valeurs codées en dur côté
+    // app). `null` si l'URL n'a pas pu être résolue ou si la connexion TLS
+    // a échoué/timeout — l'app doit afficher "—" dans ce cas, pas un chiffre
+    // inventé.
+    const siteUrl = await resolveMonitorUrl(id, m);
+    const tlsInfo = siteUrl ? await getTlsExpiry(siteUrl) : null;
+
     res.json({
       success: true,
       monitor: {
         id: m.id,
         name: m.name,
         type: m.type,
-        url: m.url ?? null,
+        url: m.url ?? siteUrl ?? null,
         hostname: m.hostname ?? null,
         port: m.port ?? null,
         interval: m.interval ?? null,
@@ -591,6 +663,7 @@ app.get('/monitors/:id', async (req, res) => {
         // pour ce monitor (voir /debug/kuma-cache pour vérifier).
         uptime24h: uptimeCache[id]?.[24] ?? null,
         uptime30d: uptimeCache[id]?.[720] ?? null,
+        tls: tlsInfo,
       },
       history,
     });
