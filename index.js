@@ -264,12 +264,29 @@ async function fetchCrawlFallback(baseUrl) {
 
 // --- Routes ---
 
+// Convertit la fréquence saisie par l'utilisateur (en heures, ex: "24") en
+// secondes pour l'intervalle Kuma. Si absent/invalide, on retombe sur 24h
+// par défaut (cohérent avec crawl_interval_minutes qui vaut 1440 par défaut
+// dans le schéma Supabase).
+const DEFAULT_FREQUENCY_HOURS = 24;
+
+function parseFrequencyHours(frequency) {
+  const hours = Number(frequency);
+  if (!frequency || Number.isNaN(hours) || hours <= 0) {
+    return DEFAULT_FREQUENCY_HOURS;
+  }
+  return hours;
+}
+
 app.post('/create-monitor', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  const { name, url, assignee } = req.body;
+  const { name, url, assignee, frequency } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
+
+  const frequencyHours = parseFrequencyHours(frequency);
+  const intervalSeconds = Math.round(frequencyHours * 3600);
 
   try {
     // Enregistre aussi un site "simple" (sans scan) dans Supabase, pour garder
@@ -281,6 +298,7 @@ app.post('/create-monitor', async (req, res) => {
         site_url: url,
         assignee: assignee || null,
         is_active: true,
+        crawl_interval_minutes: Math.round(frequencyHours * 60),
       })
       .select()
       .single();
@@ -294,8 +312,8 @@ app.post('/create-monitor', async (req, res) => {
         type: 'http',
         name: name || url,
         url,
-        interval: 60,
-        retryInterval: 60,
+        interval: intervalSeconds,
+        retryInterval: intervalSeconds,
         maxretries: 3,
         method: 'GET',
         accepted_statuscodes: ['200-299'],
@@ -350,13 +368,16 @@ app.post('/create-monitor-group', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  const { clientName, siteUrl, assignee, groupName, pages } = req.body;
+  const { clientName, siteUrl, assignee, groupName, pages, frequency } = req.body;
 
   if (!clientName || !siteUrl || !groupName || !Array.isArray(pages) || pages.length === 0) {
     return res.status(400).json({
       error: 'clientName, siteUrl, groupName et pages[] sont requis',
     });
   }
+
+  const frequencyHours = parseFrequencyHours(frequency);
+  const intervalSeconds = Math.round(frequencyHours * 3600);
 
   // --- Étape 1 : créer la ligne "sites" dans Supabase ---
   const { data: siteRow, error: siteInsertError } = await supabase
@@ -366,6 +387,7 @@ app.post('/create-monitor-group', async (req, res) => {
       site_url: siteUrl,
       assignee: assignee || null,
       is_active: true,
+      crawl_interval_minutes: Math.round(frequencyHours * 60),
     })
     .select()
     .single();
@@ -385,8 +407,8 @@ app.post('/create-monitor-group', async (req, res) => {
         {
           type: 'group',
           name: groupName,
-          interval: 60,
-          retryInterval: 60,
+          interval: intervalSeconds,
+          retryInterval: intervalSeconds,
           accepted_statuscodes: ['200-299'],
           notificationIDList: {},
         },
@@ -425,7 +447,7 @@ app.post('/create-monitor-group', async (req, res) => {
                 type: 'push', // push au lieu de http, pour écouter Playwright
                 name: page.name || page.url,
                 parent: groupId,
-                interval: 60,
+                interval: intervalSeconds,
                 accepted_statuscodes: ['200-299'],
                 notificationIDList: {},
                 pushToken, // <-- clé du fix
@@ -570,6 +592,113 @@ app.get('/monitors/:id', async (req, res) => {
       },
       history,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- POST /monitors/:id/pause -----------------------------------------------
+app.post('/monitors/:id/pause', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const id = req.params.id;
+
+  try {
+    const result = await withKuma((socket, resolve, reject) => {
+      socket.emit('pauseMonitor', id, (pauseRes) => {
+        socket.disconnect();
+        if (!pauseRes?.ok) return reject(new Error(pauseRes?.msg || 'échec pause'));
+        resolve(pauseRes);
+      });
+    });
+    res.json({ success: true, msg: result.msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- POST /monitors/:id/resume ----------------------------------------------
+app.post('/monitors/:id/resume', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const id = req.params.id;
+
+  try {
+    const result = await withKuma((socket, resolve, reject) => {
+      socket.emit('resumeMonitor', id, (resumeRes) => {
+        socket.disconnect();
+        if (!resumeRes?.ok) return reject(new Error(resumeRes?.msg || 'échec resume'));
+        resolve(resumeRes);
+      });
+    });
+    res.json({ success: true, msg: result.msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- DELETE /monitors/:id ----------------------------------------------------
+// Supprime le monitor côté Kuma, puis nettoie les traces Supabase associées :
+// - si c'est un monitor "groupe" ou un monitor simple (http) référencé
+//   directement par une ligne `sites.kuma_group_id`, on supprime cette ligne
+//   (les `push_tokens` liés partent en cascade via la FK ON DELETE CASCADE).
+// - si c'est un monitor "push" enfant d'un groupe, on supprime juste sa ligne
+//   `push_tokens` correspondante, sans toucher au reste du site.
+app.delete('/monitors/:id', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const id = req.params.id;
+  const numericId = Number(id);
+
+  try {
+    const result = await withKuma((socket, resolve, reject) => {
+      socket.emit('deleteMonitor', id, (deleteRes) => {
+        socket.disconnect();
+        if (!deleteRes?.ok) return reject(new Error(deleteRes?.msg || 'échec suppression'));
+        resolve(deleteRes);
+      });
+    });
+
+    // Nettoyage Supabase — best effort : si ça échoue, la suppression Kuma
+    // reste effective, on log juste l'erreur sans faire échouer la requête.
+    try {
+      const { data: siteMatch } = await supabase
+        .from('sites')
+        .select('id')
+        .eq('kuma_group_id', numericId)
+        .maybeSingle();
+
+      if (siteMatch?.id) {
+        const { error: deleteSiteError } = await supabase.from('sites').delete().eq('id', siteMatch.id);
+        if (deleteSiteError) {
+          console.error('[delete-monitor] Supabase site delete error:', deleteSiteError);
+        }
+      } else {
+        const { error: deleteTokenError } = await supabase
+          .from('push_tokens')
+          .delete()
+          .eq('monitor_id', numericId);
+        if (deleteTokenError) {
+          console.error('[delete-monitor] Supabase push_token delete error:', deleteTokenError);
+        }
+      }
+    } catch (cleanupErr) {
+      console.error('[delete-monitor] erreur nettoyage Supabase:', cleanupErr);
+    }
+
+    // Nettoyage du cache local pour que /monitors reflète la suppression
+    // immédiatement, sans attendre le prochain 'monitorList' de Kuma.
+    delete monitorsCache[id];
+    delete heartbeatCache[id];
+    delete heartbeatHistoryCache[id];
+    delete uptimeCache[id];
+    delete avgPingCache[id];
+    scheduleBroadcast();
+
+    res.json({ success: true, msg: result.msg });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
