@@ -210,6 +210,8 @@ function buildMonitorsPayload() {
       status,
       msg: hb?.msg ?? null,
       time: hb?.time ?? null,
+      avgPing: avgPingCache[id] ?? null,
+      uptime24h: uptimeCache[id]?.[24] ?? null,
     };
   });
 
