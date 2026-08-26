@@ -70,9 +70,14 @@ function withKuma(action) {
 // arrive réellement.
 
 let monitorsCache = {}; // { [id]: monitor object tel qu'envoyé par Kuma }
-let heartbeatCache = {}; // { [id]: dernier heartbeat { status, time, msg, ... } }
+let heartbeatCache = {}; // { [id]: dernier heartbeat { status, time, msg, ping, ... } }
+let heartbeatHistoryCache = {}; // { [id]: [heartbeat, ...] } (les MAX_HISTORY derniers, chronologique)
+let uptimeCache = {}; // { [id]: { [duration]: percent } } — duration en heures (24, 720...)
+let avgPingCache = {}; // { [id]: avgPing en ms }
 let readSocket = null;
 let readSocketReady = false;
+
+const MAX_HISTORY = 100;
 
 function connectReadSocket() {
   readSocket = io(KUMA_URL, {
@@ -111,15 +116,20 @@ function connectReadSocket() {
   readSocket.on('heartbeat', (hb) => {
     if (hb && hb.monitorID != null) {
       heartbeatCache[hb.monitorID] = hb;
+      const hist = heartbeatHistoryCache[hb.monitorID] || (heartbeatHistoryCache[hb.monitorID] = []);
+      hist.push(hb);
+      if (hist.length > MAX_HISTORY) hist.shift();
       scheduleBroadcast();
     }
   });
 
-  // Historique envoyé à la connexion pour chaque monitor : on ne garde que
-  // le plus récent (dernier élément du tableau).
+  // Historique envoyé à la connexion pour chaque monitor. On garde le dernier
+  // élément comme statut courant ET tout le tableau (plafonné) comme historique
+  // pour le graphique / la timeline sur l'écran de détail.
   readSocket.on('heartbeatList', (monitorID, list) => {
     if (Array.isArray(list) && list.length > 0) {
       heartbeatCache[monitorID] = list[list.length - 1];
+      heartbeatHistoryCache[monitorID] = list.slice(-MAX_HISTORY);
       scheduleBroadcast();
     }
   });
@@ -131,6 +141,21 @@ function connectReadSocket() {
       heartbeatCache[monitorID] = list[list.length - 1];
       scheduleBroadcast();
     }
+  });
+
+  // ⚠️ HYPOTHÈSE NON VÉRIFIÉE (comme heartbeatList à l'origine) : Kuma est
+  // censé envoyer 'uptime' (monitorID, duration, percent) et 'avgPing'
+  // (monitorID, avgPing) automatiquement pour chaque monitor après le login.
+  // Si /debug/kuma-cache montre uptimeCacheCount/avgPingCacheCount à 0 alors
+  // que readSocketReady est true, ces events n'arrivent pas comme prévu et
+  // il faudra les redemander activement (comme on l'a fait pour pushToken).
+  readSocket.on('uptime', (monitorID, duration, percent) => {
+    if (!uptimeCache[monitorID]) uptimeCache[monitorID] = {};
+    uptimeCache[monitorID][duration] = percent;
+  });
+
+  readSocket.on('avgPing', (monitorID, avgPing) => {
+    avgPingCache[monitorID] = avgPing;
   });
 }
 
@@ -482,6 +507,74 @@ app.get('/monitors', async (req, res) => {
   }
 });
 
+// --- GET /monitors/:id : détail complet pour l'écran de détail de l'app ---
+app.get('/monitors/:id', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const id = req.params.id;
+  const m = monitorsCache[id];
+
+  if (!m) {
+    return res.status(404).json({
+      error: 'Monitor introuvable (pas encore en cache côté relay, ou id invalide).',
+    });
+  }
+
+  try {
+    await requestHeartbeatIfMissing(id);
+
+    const hb = heartbeatCache[id];
+    const statusMap = { 0: 'down', 1: 'up', 2: 'pending', 3: 'maintenance' };
+
+    let status = 'pending';
+    if (!m.active) {
+      status = 'paused';
+    } else if (hb) {
+      status = statusMap[hb.status] ?? 'pending';
+    }
+
+    const parent = m.parent != null ? monitorsCache[m.parent] : null;
+
+    const history = (heartbeatHistoryCache[id] || []).map((h) => ({
+      status: statusMap[h.status] ?? 'pending',
+      time: h.time,
+      ping: h.ping ?? null,
+      msg: h.msg ?? null,
+    }));
+
+    res.json({
+      success: true,
+      monitor: {
+        id: m.id,
+        name: m.name,
+        type: m.type,
+        url: m.url ?? null,
+        hostname: m.hostname ?? null,
+        port: m.port ?? null,
+        interval: m.interval ?? null,
+        retryInterval: m.retryInterval ?? null,
+        parent: m.parent ?? null,
+        parentName: parent?.name ?? null,
+        active: m.active,
+        status,
+        msg: hb?.msg ?? null,
+        lastCheckedAt: hb?.time ?? null,
+        avgPing: avgPingCache[id] ?? null,
+        // 24 = dernières 24h, 720 = 30 jours (en heures) — valeurs standard
+        // Kuma. Peut être `null` si l'event 'uptime' n'a pas encore été reçu
+        // pour ce monitor (voir /debug/kuma-cache pour vérifier).
+        uptime24h: uptimeCache[id]?.[24] ?? null,
+        uptime30d: uptimeCache[id]?.[720] ?? null,
+      },
+      history,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- GET /debug/kuma-cache : inspection brute pour vérifier les hypothèses -
 // À utiliser une fois puis retirer si tout fonctionne comme prévu.
 app.get('/debug/kuma-cache', (req, res) => {
@@ -492,8 +585,13 @@ app.get('/debug/kuma-cache', (req, res) => {
     readSocketReady,
     monitorsCacheCount: Object.keys(monitorsCache).length,
     heartbeatCacheCount: Object.keys(heartbeatCache).length,
+    heartbeatHistoryCacheCount: Object.keys(heartbeatHistoryCache).length,
+    uptimeCacheCount: Object.keys(uptimeCache).length,
+    avgPingCacheCount: Object.keys(avgPingCache).length,
     monitorsCache,
     heartbeatCache,
+    uptimeCache,
+    avgPingCache,
   });
 });
 
