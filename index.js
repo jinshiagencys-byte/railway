@@ -219,6 +219,13 @@ function buildMonitorsPayload() {
 
   const stats = { up: 0, down: 0, pending: 0, maintenance: 0, paused: 0 };
   monitors.forEach((m) => {
+    // Un monitor de type "group" ne doit pas être compté dans les stats
+    // agrégées : Kuma lui attribue son propre statut (calculé à partir de ses
+    // enfants), ce qui double-compte sinon un groupe de 2 pages comme 3
+    // entrées (le groupe + ses 2 enfants) dans les totaux up/down/etc.
+    // Le statut affiché du groupe est recalculé côté app mobile à partir de
+    // ses enfants, indépendamment de ce champ `status`.
+    if (m.type === 'group') return;
     if (stats[m.status] !== undefined) stats[m.status] += 1;
   });
 
