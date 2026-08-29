@@ -11,8 +11,12 @@ const cheerio = require('cheerio');
 const pushTokensRoutes = require('./src/routes/pushTokens');
 const { supabase } = require('./src/lib/supabaseClient');
 
-// 👇 NOUVEAU : importer les routes de découverte d'API
-const discoverApiDomainsRoutes = require('./src/routes/discoverApiDomains');
+// Supprime ou commente l'ancien import
+// const discoverApiDomainsRoutes = require('./src/routes/discoverApiDomains');
+
+// Nouvel import
+const discoverApisRoutes = require('./src/routes/discoverApis');
+app.use('/discover-apis', discoverApisRoutes);
 
 // Instance de Socket.IO pour l'app
 let ioServer = null;
