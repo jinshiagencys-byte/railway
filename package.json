@@ -6,12 +6,15 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@octokit/rest": "^22.0.1",
     "@supabase/supabase-js": "^2.109.0",
     "axios": "^1.19.0",
     "cheerio": "^1.2.0",
     "express": "^4.19.2",
+    "playwright": "^1.62.1",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.7.5",
+    "uuid": "^14.0.2",
     "xml2js": "^0.6.2"
   }
 }
