@@ -35,7 +35,10 @@ const API_PATTERNS = (origin) => [
 async function testUrl(url) {
   try {
     // Essayer HEAD avec un timeout court
-    await axios.head(url, { timeout: TIMEOUT_MS });
+    await axios.head(url, {
+      timeout: TIMEOUT_MS,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SentinelSiteBot/1.0)' },
+    });
     return true;
   } catch (error) {
     // Si HEAD échoue (405, 404, etc.), essayer GET avec `Accept: application/json`
@@ -43,7 +46,10 @@ async function testUrl(url) {
       await axios.get(url, {
         timeout: TIMEOUT_MS,
         maxContentLength: 1024,
-        headers: { 'Accept': 'application/json' },
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (compatible; SentinelSiteBot/1.0)',
+        },
       });
       return true;
     } catch {
@@ -56,7 +62,10 @@ async function testUrl(url) {
 async function extractApiUrlsFromHtml(baseUrl) {
   const htmlUrl = baseUrl;
   try {
-    const { data } = await axios.get(htmlUrl, { timeout: TIMEOUT_MS });
+    const { data } = await axios.get(htmlUrl, {
+      timeout: TIMEOUT_MS,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SentinelSiteBot/1.0)' },
+    });
     const $ = cheerio.load(data);
     const found = new Set();
 
@@ -123,10 +132,12 @@ router.post('/', async (req, res) => {
   const patterns = API_PATTERNS(origin);
   const results = [];
 
-  // Fonction pour tester un pattern avec un délai
-  const testPattern = async (testUrl) => {
-    const alive = await testUrl(testUrl);
-    if (alive) results.push(testUrl);
+  // Fonction pour tester un pattern (FIX: paramètre renommé pour ne plus
+  // masquer la fonction testUrl() définie plus haut — c'était le bug
+  // qui faisait échouer silencieusement tous les tests)
+  const testPattern = async (candidateUrl) => {
+    const alive = await testUrl(candidateUrl);
+    if (alive) results.push(candidateUrl);
   };
 
   // Exécuter les tests en parallèle avec limite de concurrence
