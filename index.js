@@ -11,12 +11,8 @@ const cheerio = require('cheerio');
 const pushTokensRoutes = require('./src/routes/pushTokens');
 const { supabase } = require('./src/lib/supabaseClient');
 
-// Supprime ou commente l'ancien import
-// const discoverApiDomainsRoutes = require('./src/routes/discoverApiDomains');
-
-// Nouvel import
+// 👇 Importer la nouvelle route de découverte d'API (directe, sans GitHub)
 const discoverApisRoutes = require('./src/routes/discoverApis');
-app.use('/discover-apis', discoverApisRoutes);
 
 // Instance de Socket.IO pour l'app
 let ioServer = null;
@@ -36,10 +32,10 @@ const app = express();
 app.use(express.json());
 app.use(pushTokensRoutes);
 
-// 👇 NOUVEAU : monter les routes de découverte d'API
-app.use('/discover-api-domains', discoverApiDomainsRoutes);
+// 👇 Monter la route de découverte d'API
+app.use('/discover-apis', discoverApisRoutes);
 
-// Variables d'environnement
+// Variables d'environnement (sans les GITHUB_*)
 const KUMA_URL = process.env.KUMA_URL;
 const KUMA_USER = process.env.KUMA_USER;
 const KUMA_PASS = process.env.KUMA_PASS;
@@ -464,7 +460,7 @@ app.post('/create-monitor-group', async (req, res) => {
       siteId,
       groupId: result.groupId,
       created: result.allResults.map(r => r.monitorId),
-      errors: [], // on pourrait collecter des erreurs, mais on a utilisé Promise.all
+      errors: [],
     });
 
   } catch (err) {
