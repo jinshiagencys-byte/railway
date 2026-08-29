@@ -31,30 +31,55 @@ const API_PATTERNS = (origin) => [
   origin.replace(/^https?:\/\//, 'https://api.') + '/v2',
 ];
 
-// --- Test d'une URL avec requête HEAD puis GET (si HEAD échoue) ---
+// --- Content-Types considérés comme "réponse API" (pas du HTML de fallback SPA) ---
+function isApiLikeContentType(contentType) {
+  if (!contentType) return false;
+  const ct = contentType.toLowerCase();
+  return (
+    ct.includes('application/json') ||
+    ct.includes('application/xml') ||
+    ct.includes('application/graphql') ||
+    ct.includes('application/x-yaml') ||
+    ct.includes('text/yaml')
+  );
+}
+
+// --- Test d'une URL : on inspecte nous-mêmes status + content-type ---
+// (validateStatus: () => true permet de récupérer la réponse même en 404/500
+// pour l'analyser, au lieu de se contenter d'un throw/catch)
 async function testUrl(url) {
+  const commonHeaders = {
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (compatible; SentinelSiteBot/1.0)',
+  };
+
   try {
-    // Essayer HEAD avec un timeout court
-    await axios.head(url, {
+    const res = await axios.get(url, {
       timeout: TIMEOUT_MS,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SentinelSiteBot/1.0)' },
+      maxContentLength: 2048, // on ne lit qu'un extrait, pas besoin du body complet
+      headers: commonHeaders,
+      validateStatus: () => true,
     });
-    return true;
-  } catch (error) {
-    // Si HEAD échoue (405, 404, etc.), essayer GET avec `Accept: application/json`
-    try {
-      await axios.get(url, {
-        timeout: TIMEOUT_MS,
-        maxContentLength: 1024,
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (compatible; SentinelSiteBot/1.0)',
-        },
-      });
+
+    const contentType = res.headers['content-type'] || '';
+
+    // Cas 1 : réponse clairement typée API (JSON/XML/GraphQL...)
+    if (res.status < 400 && isApiLikeContentType(contentType)) {
       return true;
-    } catch {
-      return false;
     }
+
+    // Cas 2 : swagger-ui.html / docs HTML sont légitimement du text/html
+    // -> on les autorise explicitement par nom d'URL plutôt que par content-type
+    const isKnownHtmlDocPage = /swagger-ui\.html|\/docs$|\/api-docs$/i.test(url);
+    if (res.status < 400 && isKnownHtmlDocPage && contentType.includes('text/html')) {
+      return true;
+    }
+
+    // Sinon (200 mais text/html générique = probablement le fallback SPA,
+    // ou 404/500) -> on considère que ce n'est PAS une vraie API
+    return false;
+  } catch {
+    return false;
   }
 }
 
@@ -132,9 +157,6 @@ router.post('/', async (req, res) => {
   const patterns = API_PATTERNS(origin);
   const results = [];
 
-  // Fonction pour tester un pattern (FIX: paramètre renommé pour ne plus
-  // masquer la fonction testUrl() définie plus haut — c'était le bug
-  // qui faisait échouer silencieusement tous les tests)
   const testPattern = async (candidateUrl) => {
     const alive = await testUrl(candidateUrl);
     if (alive) results.push(candidateUrl);
