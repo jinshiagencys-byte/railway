@@ -628,6 +628,26 @@ app.get('/monitors/:id', async (req, res) => {
     const siteUrl = await resolveMonitorUrl(id, m);
     const tlsInfo = siteUrl ? await getTlsExpiry(siteUrl) : null;
     const logoUrl = getLogoForMonitor(m);
+
+    // 👇 NOUVEAU : client_name / assignee viennent de Supabase `sites`,
+    // rattachés au groupe (m.id si c'est le groupe lui-même, sinon m.parent)
+    const groupKumaId = m.type === 'group' ? Number(m.id) : (m.parent != null ? Number(m.parent) : Number(id));
+    let clientName = null;
+    let assignee = null;
+    try {
+      const { data: siteRow } = await supabase
+        .from('sites')
+        .select('client_name, assignee')
+        .eq('kuma_group_id', groupKumaId)
+        .maybeSingle();
+      if (siteRow) {
+        clientName = siteRow.client_name ?? null;
+        assignee = siteRow.assignee ?? null;
+      }
+    } catch (siteLookupErr) {
+      console.error('[monitors/:id] erreur lookup client/assignee:', siteLookupErr);
+    }
+
     res.json({
       success: true,
       monitor: {
@@ -650,6 +670,8 @@ app.get('/monitors/:id', async (req, res) => {
         uptime30d: uptimeCache[id]?.[720] ?? null,
         tls: tlsInfo,
         logoUrl,
+        clientName,
+        assignee,
       },
       history,
     });
