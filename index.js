@@ -392,10 +392,19 @@ app.post('/create-monitor-group', async (req, res) => {
 
   const { clientName, siteUrl, assignee, groupName, pages, frequency, apiEndpoints } = req.body;
 
-  if (!clientName || !siteUrl || !groupName || !Array.isArray(pages) || pages.length === 0) {
+  if (!clientName || !siteUrl || !groupName) {
     return res.status(400).json({
-      error: 'clientName, siteUrl, groupName et pages[] sont requis',
+      error: 'clientName, siteUrl et groupName sont requis',
     });
+  }
+
+  // 👇 Filet de sécurité : si la découverte automatique n'a rien trouvé
+  // (site protégé contre le crawl, pas de sitemap, erreur réseau, etc.),
+  // on surveille au moins la page d'accueil plutôt que de refuser la création.
+  let effectivePages = Array.isArray(pages) ? pages : [];
+  if (effectivePages.length === 0) {
+    console.warn('[create-monitor-group] aucune page découverte pour', siteUrl, '- fallback sur la page d\'accueil');
+    effectivePages = [{ url: siteUrl, name: clientName || siteUrl }];
   }
 
   const frequencyHours = parseFrequencyHours(frequency);
@@ -443,7 +452,7 @@ app.post('/create-monitor-group', async (req, res) => {
         .eq('id', siteId);
 
       // 2.3 Créer les monitors pour les pages (push)
-      const pagePromises = pages.map(async (page) => {
+      const pagePromises = effectivePages.map(async (page) => {
         const pushToken = genPushToken();
         const monitorId = await createMonitorPromise(socket, {
           type: 'push',
