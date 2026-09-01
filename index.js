@@ -10,6 +10,7 @@ const { parseStringPromise } = require('xml2js');
 const cheerio = require('cheerio');
 const pushTokensRoutes = require('./src/routes/pushTokens');
 const { supabase } = require('./src/lib/supabaseClient');
+const { getSiteLogoUrl } = require('./src/lib/favicon');
 
 // 👇 Importer la nouvelle route de découverte d'API (directe, sans GitHub)
 const discoverApisRoutes = require('./src/routes/discoverApis');
@@ -82,6 +83,44 @@ let readSocket = null;
 let readSocketReady = false;
 const MAX_HISTORY = 100;
 
+// --- Cache des logos de site, indexé par kuma_group_id ---
+let siteLogoCache = {}; // { [kuma_group_id]: logo_url }
+
+async function refreshSiteLogoCache() {
+  try {
+    const { data, error } = await supabase
+      .from('sites')
+      .select('kuma_group_id, logo_url')
+      .not('kuma_group_id', 'is', null);
+    if (error) {
+      console.error('[siteLogoCache] erreur chargement:', error);
+      return;
+    }
+    const next = {};
+    (data || []).forEach((row) => {
+      if (row.kuma_group_id != null && row.logo_url) {
+        next[row.kuma_group_id] = row.logo_url;
+      }
+    });
+    siteLogoCache = next;
+    console.log('[siteLogoCache] rechargé,', Object.keys(siteLogoCache).length, 'logos');
+  } catch (err) {
+    console.error('[siteLogoCache] erreur inattendue:', err);
+  }
+}
+
+// Charger une première fois au démarrage, puis rafraîchir périodiquement
+refreshSiteLogoCache();
+setInterval(refreshSiteLogoCache, 5 * 60 * 1000); // toutes les 5 min
+
+function getLogoForMonitor(m) {
+  return (
+    siteLogoCache[m.id] ??
+    (m.parent != null ? siteLogoCache[m.parent] : null) ??
+    null
+  );
+}
+
 function connectReadSocket() {
   readSocket = io(KUMA_URL, {
     transports: ['websocket'],
@@ -113,6 +152,7 @@ function connectReadSocket() {
   readSocket.on('monitorList', (list) => {
     monitorsCache = list || {};
     console.log('[kuma-read] monitorList reçu,', Object.keys(monitorsCache).length, 'monitors');
+    refreshSiteLogoCache();
     scheduleBroadcast();
   });
 
@@ -191,6 +231,7 @@ function buildMonitorsPayload() {
       time: hb?.time ?? null,
       avgPing: avgPingCache[id] ?? null,
       uptime24h: uptimeCache[id]?.[24] ?? null,
+      logoUrl: getLogoForMonitor(m),
     };
   });
   const stats = { up: 0, down: 0, pending: 0, maintenance: 0, paused: 0 };
@@ -256,6 +297,7 @@ app.post('/create-monitor', async (req, res) => {
 
   const frequencyHours = parseFrequencyHours(frequency);
   const intervalSeconds = Math.round(frequencyHours * 3600);
+  const logoUrl = await getSiteLogoUrl(url);
 
   try {
     const { data: siteRow, error: siteInsertError } = await supabase
@@ -263,6 +305,7 @@ app.post('/create-monitor', async (req, res) => {
       .insert({
         client_name: name || url,
         site_url: url,
+        logo_url: logoUrl,
         assignee: assignee || null,
         is_active: true,
         crawl_interval_minutes: Math.round(frequencyHours * 60),
@@ -298,6 +341,8 @@ app.post('/create-monitor', async (req, res) => {
         resolve({ ...addRes, monitorId });
       });
     });
+
+    await refreshSiteLogoCache();
 
     res.json({ success: true, monitorId: result.monitorId, msg: result.msg });
   } catch (err) {
@@ -340,6 +385,7 @@ app.post('/create-monitor-group', async (req, res) => {
 
   const frequencyHours = parseFrequencyHours(frequency);
   const intervalSeconds = Math.round(frequencyHours * 3600);
+  const logoUrl = await getSiteLogoUrl(siteUrl);
 
   // --- Étape 1 : créer la ligne "sites" dans Supabase ---
   const { data: siteRow, error: siteInsertError } = await supabase
@@ -347,6 +393,7 @@ app.post('/create-monitor-group', async (req, res) => {
     .insert({
       client_name: clientName,
       site_url: siteUrl,
+      logo_url: logoUrl,
       assignee: assignee || null,
       is_active: true,
       crawl_interval_minutes: Math.round(frequencyHours * 60),
@@ -455,6 +502,8 @@ app.post('/create-monitor-group', async (req, res) => {
       }
     }
 
+    await refreshSiteLogoCache();
+
     res.json({
       success: true,
       siteId,
@@ -469,7 +518,7 @@ app.post('/create-monitor-group', async (req, res) => {
   }
 });
 
-// --- GET /monitors --- (inchangé)
+// --- GET /monitors ---
 app.get('/monitors', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -528,7 +577,7 @@ function getTlsExpiry(siteUrl) {
   });
 }
 
-// --- GET /monitors/:id (inchangé) ---
+// --- GET /monitors/:id ---
 app.get('/monitors/:id', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -554,6 +603,7 @@ app.get('/monitors/:id', async (req, res) => {
     }));
     const siteUrl = await resolveMonitorUrl(id, m);
     const tlsInfo = siteUrl ? await getTlsExpiry(siteUrl) : null;
+    const logoUrl = getLogoForMonitor(m);
     res.json({
       success: true,
       monitor: {
@@ -575,6 +625,7 @@ app.get('/monitors/:id', async (req, res) => {
         uptime24h: uptimeCache[id]?.[24] ?? null,
         uptime30d: uptimeCache[id]?.[720] ?? null,
         tls: tlsInfo,
+        logoUrl,
       },
       history,
     });
@@ -682,11 +733,44 @@ app.get('/debug/kuma-cache', (req, res) => {
     heartbeatHistoryCacheCount: Object.keys(heartbeatHistoryCache).length,
     uptimeCacheCount: Object.keys(uptimeCache).length,
     avgPingCacheCount: Object.keys(avgPingCache).length,
+    siteLogoCacheCount: Object.keys(siteLogoCache).length,
     monitorsCache,
     heartbeatCache,
     uptimeCache,
     avgPingCache,
+    siteLogoCache,
   });
+});
+
+// 👇 NOUVELLE route : backfill des logos pour les sites déjà existants (créés avant ce patch)
+app.post('/backfill-logos', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const { data: sites, error } = await supabase
+      .from('sites')
+      .select('id, site_url, logo_url')
+      .is('logo_url', null);
+
+    if (error) throw error;
+
+    const results = [];
+    for (const site of sites || []) {
+      const logoUrl = await getSiteLogoUrl(site.site_url);
+      const { error: updateError } = await supabase
+        .from('sites')
+        .update({ logo_url: logoUrl })
+        .eq('id', site.id);
+      results.push({ id: site.id, site_url: site.site_url, logoUrl, ok: !updateError });
+    }
+
+    await refreshSiteLogoCache();
+
+    res.json({ success: true, updated: results.length, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
