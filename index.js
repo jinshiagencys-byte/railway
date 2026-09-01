@@ -254,23 +254,32 @@ function scheduleBroadcast() {
 }
 
 // --- Helpers découverte de pages ---
+const DISCOVERY_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 SentinelSiteBot/1.0',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+};
+
 async function fetchSitemapPages(baseUrl) {
   const sitemapUrl = new URL('/sitemap.xml', baseUrl).toString();
-  const { data } = await axios.get(sitemapUrl, { timeout: 8000 });
+  const { data } = await axios.get(sitemapUrl, { timeout: 8000, headers: DISCOVERY_HEADERS });
   const parsed = await parseStringPromise(data);
   const urls = parsed?.urlset?.url?.map((u) => u.loc[0]) || [];
   return urls.map((u) => ({ url: u, name: null }));
 }
 
 async function fetchCrawlFallback(baseUrl) {
-  const { data } = await axios.get(baseUrl, { timeout: 8000 });
+  const { data, request } = await axios.get(baseUrl, { timeout: 8000, headers: DISCOVERY_HEADERS });
   const $ = cheerio.load(data);
-  const origin = new URL(baseUrl).origin;
+  // On récupère l'origine RÉELLE après d'éventuelles redirections (www, http->https, etc.),
+  // sinon les liens de la page finale sont filtrés à tort car ils ne matchent plus
+  // l'origine de départ.
+  const finalUrl = request?.res?.responseUrl || baseUrl;
+  const origin = new URL(finalUrl).origin;
   const found = new Set();
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href');
     try {
-      const abs = new URL(href, baseUrl).toString();
+      const abs = new URL(href, finalUrl).toString();
       if (abs.startsWith(origin)) found.add(abs.split('#')[0]);
     } catch (_) {}
   });
@@ -359,9 +368,15 @@ app.post('/discover-pages', async (req, res) => {
   if (!url) return res.status(400).json({ error: 'url is required' });
 
   try {
-    let pages = await fetchSitemapPages(url).catch(() => []);
+    let pages = await fetchSitemapPages(url).catch((err) => {
+      console.warn('[discover-pages] sitemap échoué pour', url, ':', err.message);
+      return [];
+    });
     if (pages.length === 0) {
-      pages = await fetchCrawlFallback(url);
+      pages = await fetchCrawlFallback(url).catch((err) => {
+        console.warn('[discover-pages] crawl fallback échoué pour', url, ':', err.message);
+        return [];
+      });
     }
     res.json({ success: true, pages });
   } catch (err) {
