@@ -629,23 +629,30 @@ app.get('/monitors/:id', async (req, res) => {
     const tlsInfo = siteUrl ? await getTlsExpiry(siteUrl) : null;
     const logoUrl = getLogoForMonitor(m);
 
-    // 👇 NOUVEAU : client_name / assignee viennent de Supabase `sites`,
-    // rattachés au groupe (m.id si c'est le groupe lui-même, sinon m.parent)
+    // 👇 NOUVEAU : client_name / assignee / rapport OpenClaw viennent de
+    // Supabase `sites`, rattachés au groupe (m.id si c'est le groupe
+    // lui-même, sinon m.parent)
     const groupKumaId = m.type === 'group' ? Number(m.id) : (m.parent != null ? Number(m.parent) : Number(id));
     let clientName = null;
     let assignee = null;
+    let lastCrawlStatus = null;
+    let lastCrawlReport = null;
+    let lastCrawledAt = null;
     try {
       const { data: siteRow } = await supabase
         .from('sites')
-        .select('client_name, assignee')
+        .select('client_name, assignee, last_crawl_status, last_crawl_report, last_crawled_at')
         .eq('kuma_group_id', groupKumaId)
         .maybeSingle();
       if (siteRow) {
         clientName = siteRow.client_name ?? null;
         assignee = siteRow.assignee ?? null;
+        lastCrawlStatus = siteRow.last_crawl_status ?? null;
+        lastCrawlReport = siteRow.last_crawl_report ?? null;
+        lastCrawledAt = siteRow.last_crawled_at ?? null;
       }
     } catch (siteLookupErr) {
-      console.error('[monitors/:id] erreur lookup client/assignee:', siteLookupErr);
+      console.error('[monitors/:id] erreur lookup client/assignee/crawl:', siteLookupErr);
     }
 
     res.json({
@@ -672,6 +679,9 @@ app.get('/monitors/:id', async (req, res) => {
         logoUrl,
         clientName,
         assignee,
+        lastCrawlStatus,
+        lastCrawlReport,
+        lastCrawledAt,
       },
       history,
     });
