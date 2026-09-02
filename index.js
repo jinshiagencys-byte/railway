@@ -11,7 +11,6 @@ const pushTokensRoutes = require('./src/routes/pushTokens');
 const { supabase } = require('./src/lib/supabaseClient');
 const { getSiteLogoUrl } = require('./src/lib/favicon');
 
-// Routes additionnelles
 const discoverApisRoutes = require('./src/routes/discoverApis');
 
 const app = express();
@@ -19,16 +18,11 @@ app.use(express.json());
 app.use(pushTokensRoutes);
 app.use('/discover-apis', discoverApisRoutes);
 
-// Variables d'environnement
 const KUMA_URL = process.env.KUMA_URL;
 const KUMA_USER = process.env.KUMA_USER;
 const KUMA_PASS = process.env.KUMA_PASS;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const DEFAULT_FREQUENCY_HOURS = 24;
-
-// ============================================================
-//  UTILITAIRES (création Kuma, tokens, etc.)
-// ============================================================
 
 function genPushToken(length = 32) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -40,7 +34,6 @@ function genPushToken(length = 32) {
   return token;
 }
 
-// Connexion Kuma pour les actions d'écriture (création, pause, etc.)
 function withKuma(action) {
   return new Promise((resolve, reject) => {
     const socket = io(KUMA_URL, { transports: ['websocket'] });
@@ -69,9 +62,9 @@ function createMonitorPromise(socket, data) {
   });
 }
 
-// ============================================================
-//  HELPERS POUR LA LECTURE SUPABASE
-// ============================================================
+// ================================================================
+// LECTURE SUPABASE
+// ================================================================
 
 async function buildMonitorsPayloadFromSupabase() {
   const { data: sites, error } = await supabase
@@ -115,7 +108,6 @@ async function buildMonitorsPayloadFromSupabase() {
   const stats = { up: 0, down: 0, pending: 0, maintenance: 0, paused: 0 };
 
   sites.forEach((site) => {
-    // Groupe = le site lui-même
     monitors.push({
       id: site.id,
       name: site.client_name,
@@ -123,7 +115,7 @@ async function buildMonitorsPayloadFromSupabase() {
       parent: null,
       parentName: null,
       active: site.is_active,
-      status: 'pending', // on le calculera à partir des pages
+      status: 'pending',
       msg: null,
       time: null,
       url: site.site_url,
@@ -139,7 +131,6 @@ async function buildMonitorsPayloadFromSupabase() {
       lastCrawledAt: null,
     });
 
-    // Pages enfants
     const pages = site.pages || [];
     let anyDown = false;
     pages.forEach((page) => {
@@ -157,7 +148,7 @@ async function buildMonitorsPayloadFromSupabase() {
         else status = 'pending';
       }
 
-      const monitorItem = {
+      monitors.push({
         id: page.id,
         name: page.name || page.url,
         type: 'http',
@@ -178,8 +169,7 @@ async function buildMonitorsPayloadFromSupabase() {
         metricsCheckedAt: site.metrics_checked_at,
         assignee: site.assignee,
         lastCrawledAt: latest?.checked_at || null,
-      };
-      monitors.push(monitorItem);
+      });
 
       if (status !== 'paused') {
         if (stats[status] !== undefined) stats[status] += 1;
@@ -188,11 +178,9 @@ async function buildMonitorsPayloadFromSupabase() {
       }
     });
 
-    // Mettre à jour le statut du groupe (si une page est down, le groupe est down)
     const groupMonitor = monitors.find(m => m.id === site.id && m.type === 'group');
     if (groupMonitor) {
       groupMonitor.status = anyDown ? 'down' : (pages.length > 0 ? 'up' : 'pending');
-      // Prendre le dernier check de la première page pour l'heure
       if (pages.length > 0) {
         const firstPage = pages[0];
         const checks = firstPage.page_checks || [];
@@ -313,7 +301,6 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     return { monitor, history };
   } else {
-    // C'est une page
     const { data: page, error } = await supabase
       .from('pages')
       .select(`
@@ -336,7 +323,7 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     if (error || !page) return null;
 
-    const { data: site, error: siteErr } = await supabase
+    const { data: site } = await supabase
       .from('sites')
       .select('client_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at')
       .eq('id', page.site_id)
@@ -390,9 +377,24 @@ async function getMonitorDetailFromSupabase(id, type) {
   }
 }
 
-// ============================================================
-//  ROUTES DE LECTURE (Supabase)
-// ============================================================
+// ================================================================
+// ROUTES
+// ================================================================
+
+app.get('/active-sites', async (req, res) => {
+  try {
+    const { data: sites, error } = await supabase
+      .from('sites')
+      .select('id, client_name, site_url')
+      .eq('is_active', true);
+
+    if (error) throw error;
+    res.json({ success: true, sites: sites || [] });
+  } catch (err) {
+    console.error('[GET /active-sites] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/monitors', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
@@ -422,10 +424,6 @@ app.get('/monitors/:id', async (req, res) => {
   res.json({ success: true, ...detail });
 });
 
-// ============================================================
-//  ROUTE : /sites/:id/pages-report (OpenClaw)
-// ============================================================
-
 app.post('/sites/:id/pages-report', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -448,7 +446,7 @@ app.post('/sites/:id/pages-report', async (req, res) => {
     }
 
     for (const pageData of pages) {
-      let { data: existingPage, error: findError } = await supabase
+      let { data: existingPage } = await supabase
         .from('pages')
         .select('id')
         .eq('site_id', siteId)
@@ -495,7 +493,6 @@ app.post('/sites/:id/pages-report', async (req, res) => {
       }
     }
 
-    // Mettre à jour last_crawled_at du site
     await supabase
       .from('sites')
       .update({ last_crawled_at: new Date().toISOString() })
@@ -508,9 +505,29 @@ app.post('/sites/:id/pages-report', async (req, res) => {
   }
 });
 
-// ============================================================
-//  HELPERS DE DÉCOUVERTE DE PAGES (pour les routes de création)
-// ============================================================
+app.post('/sites/:id/mark-crawled', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const siteId = req.params.id;
+  const { status, message } = req.body;
+
+  try {
+    await supabase
+      .from('sites')
+      .update({
+        last_crawled_at: new Date().toISOString(),
+        last_crawl_status: status,
+        last_crawl_message: message,
+      })
+      .eq('id', siteId);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /mark-crawled] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const DISCOVERY_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 SentinelSiteBot/1.0',
@@ -549,426 +566,73 @@ function parseFrequencyHours(frequency) {
   return hours;
 }
 
-// ============================================================
-//  ROUTES DE CRÉATION
-// ============================================================
-
 app.post('/create-monitor', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  const { name, url, assignee, frequency } = req.body;
-  if (!url) return res.status(400).json({ error: 'url is required' });
 
-  const frequencyHours = parseFrequencyHours(frequency);
-  const intervalSeconds = Math.round(frequencyHours * 3600);
-  const logoUrl = await getSiteLogoUrl(url);
+  const { name, url, frequency, assignee } = req.body;
+  if (!name || !url) {
+    return res.status(400).json({ error: 'Nom et URL requis.' });
+  }
 
   try {
-    const { data: siteRow, error: siteInsertError } = await supabase
+    const logoUrl = await getSiteLogoUrl(url);
+    const intervalHours = parseFrequencyHours(frequency);
+    const crawlIntervalMinutes = intervalHours * 60;
+
+    const { data: site, error } = await supabase
       .from('sites')
       .insert({
-        client_name: name || url,
+        client_name: name,
         site_url: url,
         logo_url: logoUrl,
         assignee: assignee || null,
         is_active: true,
-        crawl_interval_minutes: Math.round(frequencyHours * 60),
+        crawl_interval_minutes: crawlIntervalMinutes,
       })
       .select()
       .single();
 
-    if (siteInsertError) {
-      console.error('[create-monitor] Supabase site insert error:', siteInsertError);
-    }
-
-    const result = await withKuma((socket, resolve, reject) => {
-      socket.emit('add', {
-        type: 'http',
-        name: name || url,
-        url,
-        interval: intervalSeconds,
-        retryInterval: intervalSeconds,
-        maxretries: 3,
-        method: 'GET',
-        accepted_statuscodes: ['200-299'],
-        notificationIDList: {}
-      }, async (addRes) => {
-        socket.disconnect();
-        if (!addRes.ok) return reject(new Error(addRes.msg));
-        const monitorId = addRes.monitorID ?? addRes.monitorId;
-        if (siteRow?.id) {
-          await supabase
-            .from('sites')
-            .update({ kuma_group_id: monitorId })
-            .eq('id', siteRow.id);
-        }
-        resolve({ ...addRes, monitorId });
-      });
-    });
-
-    res.json({ success: true, monitorId: result.monitorId, msg: result.msg });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/discover-pages', async (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'url is required' });
-
-  try {
-    let pages = await fetchSitemapPages(url).catch((err) => {
-      console.warn('[discover-pages] sitemap échoué pour', url, ':', err.message);
-      return [];
-    });
-    if (pages.length === 0) {
-      pages = await fetchCrawlFallback(url).catch((err) => {
-        console.warn('[discover-pages] crawl fallback échoué pour', url, ':', err.message);
-        return [];
-      });
-    }
-    res.json({ success: true, pages });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/create-monitor-group', async (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
-  const { clientName, siteUrl, assignee, groupName, pages, frequency, apiEndpoints } = req.body;
-
-  if (!clientName || !siteUrl || !groupName) {
-    return res.status(400).json({
-      error: 'clientName, siteUrl et groupName sont requis',
-    });
-  }
-
-  let effectivePages = Array.isArray(pages) ? pages : [];
-  if (effectivePages.length === 0) {
-    console.warn('[create-monitor-group] aucune page découverte pour', siteUrl, '- fallback sur la page d\'accueil');
-    effectivePages = [{ url: siteUrl, name: clientName || siteUrl }];
-  }
-
-  const frequencyHours = parseFrequencyHours(frequency);
-  const intervalSeconds = Math.round(frequencyHours * 3600);
-  const logoUrl = await getSiteLogoUrl(siteUrl);
-
-  // --- Étape 1 : créer la ligne "sites" dans Supabase ---
-  const { data: siteRow, error: siteInsertError } = await supabase
-    .from('sites')
-    .insert({
-      client_name: clientName,
-      site_url: siteUrl,
-      logo_url: logoUrl,
-      assignee: assignee || null,
-      is_active: true,
-      crawl_interval_minutes: Math.round(frequencyHours * 60),
-    })
-    .select()
-    .single();
-
-  if (siteInsertError) {
-    console.error('[create-monitor-group] Supabase site insert error:', siteInsertError);
-    return res.status(500).json({ error: "Échec de l'enregistrement du site." });
-  }
-
-  const siteId = siteRow.id;
-
-  // --- Étape 2 : création du groupe et des monitors (pages + APIs) via Kuma ---
-  try {
-    const result = await withKuma(async (socket, resolve, reject) => {
-      // 2.1 Créer le groupe
-      const groupId = await createMonitorPromise(socket, {
-        type: 'group',
-        name: groupName,
-        interval: intervalSeconds,
-        retryInterval: intervalSeconds,
-        accepted_statuscodes: ['200-299'],
-        notificationIDList: {},
-      });
-
-      // 2.2 Lier kuma_group_id à la ligne "sites"
-      await supabase
-        .from('sites')
-        .update({ kuma_group_id: groupId })
-        .eq('id', siteId);
-
-      // 2.3 Créer les monitors pour les pages (push)
-      const pagePromises = effectivePages.map(async (page) => {
-        const pushToken = genPushToken();
-        const monitorId = await createMonitorPromise(socket, {
-          type: 'push',
-          name: page.name || page.url,
-          parent: groupId,
-          interval: intervalSeconds,
-          accepted_statuscodes: ['200-299'],
-          notificationIDList: {},
-          pushToken,
-        });
-        return { type: 'page', monitorId, url: page.url, name: page.name || page.url, pushToken };
-      });
-
-      // 2.4 Créer les monitors pour les APIs (http)
-      const apiPromises = (apiEndpoints || []).map(async (endpoint) => {
-        const monitorId = await createMonitorPromise(socket, {
-          type: 'http',
-          name: endpoint.name || endpoint.url,
-          url: endpoint.url,
-          interval: intervalSeconds,
-          retryInterval: intervalSeconds,
-          maxretries: 3,
-          method: 'GET',
-          accepted_statuscodes: ['200-299'],
-          notificationIDList: {},
-        });
-        return { type: 'api', monitorId, url: endpoint.url, name: endpoint.name || endpoint.url };
-      });
-
-      const allResults = await Promise.all([...pagePromises, ...apiPromises]);
-
-      socket.disconnect();
-      resolve({ groupId, allResults });
-    });
-
-    // --- Étape 3 : enregistrer les résultats dans Supabase ---
-    const pageResults = result.allResults.filter(r => r.type === 'page');
-    const apiResults = result.allResults.filter(r => r.type === 'api');
-
-    // Pages → push_tokens
-    if (pageResults.length > 0) {
-      const pushTokenRows = pageResults.map(p => ({
-        group_id: result.groupId,
-        monitor_id: p.monitorId,
-        url: p.url,
-        name: p.name,
-        push_token: p.pushToken,
-        site_id: siteId,
-      }));
-      const { error: insertTokensError } = await supabase
-        .from('push_tokens')
-        .insert(pushTokenRows);
-      if (insertTokensError) {
-        console.error('[create-monitor-group] Supabase push_tokens insert error:', insertTokensError);
-      }
-
-      // 👇 INSÉRER AUSSI DANS LA TABLE `pages`
-      const pageRows = pageResults.map(p => ({
-        site_id: siteId,
-        url: p.url,
-        name: p.name,
-        is_active: true,
-        discovered_dynamically: false,
-        kuma_monitor_id: p.monitorId,
-      }));
-      const { error: insertPagesError } = await supabase
-        .from('pages')
-        .insert(pageRows);
-      if (insertPagesError) {
-        console.error('[create-monitor-group] Supabase pages insert error:', insertPagesError);
-      }
-    }
-
-    // APIs → api_endpoints
-    if (apiResults.length > 0) {
-      const apiRows = apiResults.map(a => ({
-        site_id: siteId,
-        monitor_id: a.monitorId,
-        url: a.url,
-        name: a.name,
-      }));
-      const { error: insertApiError } = await supabase
-        .from('api_endpoints')
-        .insert(apiRows);
-      if (insertApiError) {
-        console.error('[create-monitor-group] Supabase api_endpoints insert error:', insertApiError);
-      }
-    }
-
-    res.json({
-      success: true,
-      siteId,
-      groupId: result.groupId,
-      created: result.allResults.map(r => r.monitorId),
-      errors: [],
-    });
-
-  } catch (err) {
-    console.error('[create-monitor-group] Erreur:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/monitors/:id/pause', async (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  const id = req.params.id;
-  try {
-    const result = await withKuma((socket, resolve, reject) => {
-      socket.emit('pauseMonitor', id, (pauseRes) => {
-        socket.disconnect();
-        if (!pauseRes?.ok) return reject(new Error(pauseRes?.msg || 'échec pause'));
-        resolve(pauseRes);
-      });
-    });
-    res.json({ success: true, msg: result.msg });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/monitors/:id/resume', async (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  const id = req.params.id;
-  try {
-    const result = await withKuma((socket, resolve, reject) => {
-      socket.emit('resumeMonitor', id, (resumeRes) => {
-        socket.disconnect();
-        if (!resumeRes?.ok) return reject(new Error(resumeRes?.msg || 'échec resume'));
-        resolve(resumeRes);
-      });
-    });
-    res.json({ success: true, msg: result.msg });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/monitors/:id', async (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  const id = req.params.id;
-  const numericId = Number(id);
-  try {
-    const result = await withKuma((socket, resolve, reject) => {
-      socket.emit('deleteMonitor', id, (deleteRes) => {
-        socket.disconnect();
-        if (!deleteRes?.ok) return reject(new Error(deleteRes?.msg || 'échec suppression'));
-        resolve(deleteRes);
-      });
-    });
-
-    // Nettoyage Supabase
-    try {
-      const { data: siteMatch } = await supabase
-        .from('sites')
-        .select('id')
-        .eq('kuma_group_id', numericId)
-        .maybeSingle();
-
-      if (siteMatch?.id) {
-        await supabase.from('sites').delete().eq('id', siteMatch.id);
-      } else {
-        await supabase.from('push_tokens').delete().eq('monitor_id', numericId);
-        await supabase.from('api_endpoints').delete().eq('monitor_id', numericId);
-        await supabase.from('pages').delete().eq('kuma_monitor_id', numericId);
-      }
-    } catch (cleanupErr) {
-      console.error('[delete-monitor] erreur nettoyage Supabase:', cleanupErr);
-    }
-
-    res.json({ success: true, msg: result.msg });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-//  ROUTES DIVERSES
-// ============================================================
-
-app.get('/debug/kuma-cache', (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  res.json({ message: 'Cache Kuma désactivé, lecture Supabase uniquement.' });
-});
-
-app.post('/backfill-logos', async (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  try {
-    const { data: sites, error } = await supabase
-      .from('sites')
-      .select('id, site_url, logo_url')
-      .is('logo_url', null);
-
     if (error) throw error;
 
-    const results = [];
-    for (const site of sites || []) {
-      const logoUrl = await getSiteLogoUrl(site.site_url);
-      const { error: updateError } = await supabase
-        .from('sites')
-        .update({ logo_url: logoUrl })
-        .eq('id', site.id);
-      results.push({ id: site.id, site_url: site.site_url, logoUrl, ok: !updateError });
+    let discoveredPages = [];
+    try {
+      discoveredPages = await fetchSitemapPages(url);
+    } catch (_) {
+      try {
+        discoveredPages = await fetchCrawlFallback(url);
+      } catch (_) {
+        discoveredPages = [{ url, name: 'Page d\'accueil' }];
+      }
     }
 
-    res.json({ success: true, updated: results.length, results });
+    if (!discoveredPages.some(p => p.url === url)) {
+      discoveredPages.unshift({ url, name: 'Page d\'accueil' });
+    }
+
+    for (const p of discoveredPages) {
+      await supabase.from('pages').insert({
+        site_id: site.id,
+        url: p.url,
+        name: p.name || p.url,
+        is_active: true,
+        discovered_dynamically: false,
+      });
+    }
+
+    res.json({ success: true, site });
   } catch (err) {
+    console.error('[POST /create-monitor] Erreur:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-// ============================================================
-//  SOCKET.IO (temps réel basé sur Supabase)
-// ============================================================
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 const PORT = process.env.PORT || 3000;
-const server = http.createServer(app);
-const ioServer = new SocketIOServer(server, {
-  cors: { origin: '*' },
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
-
-ioServer.use((socket, next) => {
-  const secret = socket.handshake.auth?.secret;
-  if (!RELAY_SECRET || secret !== RELAY_SECRET) {
-    return next(new Error('unauthorized'));
-  }
-  next();
-});
-
-let broadcastInterval = null;
-
-function startBroadcast() {
-  if (broadcastInterval) clearInterval(broadcastInterval);
-  broadcastInterval = setInterval(async () => {
-    try {
-      const payload = await buildMonitorsPayloadFromSupabase();
-      ioServer.emit('monitors:update', payload);
-    } catch (err) {
-      console.error('[broadcast] Erreur:', err);
-    }
-  }, 5000);
-}
-
-ioServer.on('connection', async (socket) => {
-  console.log('[ws] client connecté:', socket.id);
-  try {
-    const payload = await buildMonitorsPayloadFromSupabase();
-    socket.emit('monitors:update', payload);
-  } catch (err) {
-    console.error('[ws] Erreur envoi initial:', err);
-  }
-  socket.on('disconnect', () => {
-    console.log('[ws] client déconnecté:', socket.id);
-  });
-});
-
-startBroadcast();
-
-server.listen(PORT, () => console.log(`Relay listening on ${PORT}`));
