@@ -42,16 +42,11 @@ router.get('/active-sites', async (req, res) => {
 
 // Route appelée par le workflow OpenClaw juste après avoir testé un site,
 // pour enregistrer la date de dernier passage ET le rapport de vérification
-// (statut global + détail par page). Avant, seul last_crawled_at était
-// écrit — status/message du body étaient reçus mais jamais persistés.
+// (statut global + détail par page).
 router.post('/sites/:id/mark-crawled', async (req, res) => {
   const { id } = req.params;
   const { status, message } = req.body || {};
 
-  // `status` : "UP" | "DOWN" | "ERROR" | "UNKNOWN" (voir workflow OpenClaw)
-  // `message` : soit un tableau structuré de pages (cas normal, voir task.md
-  // du workflow), soit une simple chaîne de repli — on stocke tel quel en
-  // JSONB, la normalisation à l'affichage se fait côté app.
   const updatePayload = {
     last_crawled_at: new Date().toISOString(),
   };
@@ -69,6 +64,32 @@ router.post('/sites/:id/mark-crawled', async (req, res) => {
   if (error) {
     console.error('[mark-crawled] Supabase error:', error);
     return res.status(500).json({ success: false, error: 'Erreur mise à jour last_crawled_at.' });
+  }
+  res.json({ success: true });
+});
+
+// 👇 NOUVEAU : appelée par le script Playwright dédié (SSL + temps de
+// chargement de l'URL principale), lancé AVANT OpenClaw dans le workflow.
+// Remplace ce qu'on tirait auparavant de Kuma pour ces deux métriques.
+router.post('/sites/:id/update-metrics', async (req, res) => {
+  const { id } = req.params;
+  const { sslValidTo, sslDaysRemaining, sslIssuer, loadTimeMs } = req.body || {};
+
+  const updatePayload = {
+    metrics_checked_at: new Date().toISOString(),
+  };
+  if (sslValidTo !== undefined) updatePayload.ssl_valid_to = sslValidTo;
+  if (sslDaysRemaining !== undefined) updatePayload.ssl_days_remaining = sslDaysRemaining;
+  if (sslIssuer !== undefined) updatePayload.ssl_issuer = sslIssuer;
+  if (loadTimeMs !== undefined) updatePayload.load_time_ms = loadTimeMs;
+
+  const { error } = await supabase
+    .from('sites')
+    .update(updatePayload)
+    .eq('id', id);
+  if (error) {
+    console.error('[update-metrics] Supabase error:', error);
+    return res.status(500).json({ success: false, error: 'Erreur mise à jour des métriques.' });
   }
   res.json({ success: true });
 });
