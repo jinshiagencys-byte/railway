@@ -626,22 +626,33 @@ app.get('/monitors/:id', async (req, res) => {
       msg: h.msg ?? null,
     }));
     const siteUrl = await resolveMonitorUrl(id, m);
-    const tlsInfo = siteUrl ? await getTlsExpiry(siteUrl) : null;
+    // 👇 tlsInfo (tls.connect live) retiré : remplacé par ssl_valid_to/
+    // ssl_days_remaining/ssl_issuer stockés sur `sites` par check-metrics.js
+    // (Playwright dédié), voir lookup ci-dessous — évite un appel réseau
+    // supplémentaire à chaque requête de détail.
     const logoUrl = getLogoForMonitor(m);
 
-    // 👇 NOUVEAU : client_name / assignee / rapport OpenClaw viennent de
-    // Supabase `sites`, rattachés au groupe (m.id si c'est le groupe
-    // lui-même, sinon m.parent)
+    // 👇 NOUVEAU : client_name / assignee / rapport OpenClaw / métriques
+    // Playwright dédiées (SSL + temps de chargement, calculées par
+    // check-metrics.js et stockées sur `sites`) viennent de Supabase,
+    // rattachées au groupe (m.id si c'est le groupe lui-même, sinon m.parent)
     const groupKumaId = m.type === 'group' ? Number(m.id) : (m.parent != null ? Number(m.parent) : Number(id));
     let clientName = null;
     let assignee = null;
     let lastCrawlStatus = null;
     let lastCrawlReport = null;
     let lastCrawledAt = null;
+    let sslValidTo = null;
+    let sslDaysRemaining = null;
+    let sslIssuer = null;
+    let loadTimeMs = null;
+    let metricsCheckedAt = null;
     try {
       const { data: siteRow } = await supabase
         .from('sites')
-        .select('client_name, assignee, last_crawl_status, last_crawl_report, last_crawled_at')
+        .select(
+          'client_name, assignee, last_crawl_status, last_crawl_report, last_crawled_at, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at'
+        )
         .eq('kuma_group_id', groupKumaId)
         .maybeSingle();
       if (siteRow) {
@@ -650,9 +661,14 @@ app.get('/monitors/:id', async (req, res) => {
         lastCrawlStatus = siteRow.last_crawl_status ?? null;
         lastCrawlReport = siteRow.last_crawl_report ?? null;
         lastCrawledAt = siteRow.last_crawled_at ?? null;
+        sslValidTo = siteRow.ssl_valid_to ?? null;
+        sslDaysRemaining = siteRow.ssl_days_remaining ?? null;
+        sslIssuer = siteRow.ssl_issuer ?? null;
+        loadTimeMs = siteRow.load_time_ms ?? null;
+        metricsCheckedAt = siteRow.metrics_checked_at ?? null;
       }
     } catch (siteLookupErr) {
-      console.error('[monitors/:id] erreur lookup client/assignee/crawl:', siteLookupErr);
+      console.error('[monitors/:id] erreur lookup client/assignee/crawl/metrics:', siteLookupErr);
     }
 
     res.json({
@@ -672,16 +688,23 @@ app.get('/monitors/:id', async (req, res) => {
         status,
         msg: hb?.msg ?? null,
         lastCheckedAt: hb?.time ?? null,
-        avgPing: avgPingCache[id] ?? null,
+        // 👇 avgPing (ping Kuma) retiré : remplacé par loadTimeMs
+        // (temps de chargement réel, check-metrics.js) ci-dessous
         uptime24h: uptimeCache[id]?.[24] ?? null,
         uptime30d: uptimeCache[id]?.[720] ?? null,
-        tls: tlsInfo,
+        // 👇 tls (tls.connect live) retiré : remplacé par sslValidTo/
+        // sslDaysRemaining/sslIssuer ci-dessous
         logoUrl,
         clientName,
         assignee,
         lastCrawlStatus,
         lastCrawlReport,
         lastCrawledAt,
+        sslValidTo,
+        sslDaysRemaining,
+        sslIssuer,
+        loadTimeMs,
+        metricsCheckedAt,
       },
       history,
     });
