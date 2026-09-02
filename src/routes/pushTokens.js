@@ -38,17 +38,30 @@ router.get('/push-tokens', async (req, res) => {
 // Route appelée par le workflow OpenClaw juste après avoir testé un site,
 // pour enregistrer la date de dernier passage ET le rapport de vérification
 // (statut global + détail par page).
+//
+// 👇 MODIFIÉ : sur un statut DOWN/ERROR, on passe aussi
+// sites.crawl_acknowledged à false. Tant que ce flag reste false, la route
+// GET /active-sites d'index.js exclut ce site — donc OpenClaw arrête de le
+// re-tester jusqu'à ce qu'un humain confirme le fix via
+// POST /sites/:id/acknowledge. Un statut UP ne remet PAS le flag à true
+// automatiquement : si le site était déjà en pause d'acquittement, aucun
+// nouveau check ne peut arriver avant l'acquittement — c'est l'acquittement
+// lui-même qui doit réactiver les checks.
 router.post('/sites/:id/mark-crawled', async (req, res) => {
   const { id } = req.params;
   const { status, message } = req.body || {};
   const updatePayload = {
     last_crawled_at: new Date().toISOString(),
   };
-  if (typeof status === 'string' && status.length > 0) {
-    updatePayload.last_crawl_status = status.toUpperCase();
+  const normalizedStatus = typeof status === 'string' ? status.toUpperCase() : null;
+  if (normalizedStatus) {
+    updatePayload.last_crawl_status = normalizedStatus;
   }
   if (message !== undefined) {
     updatePayload.last_crawl_report = message;
+  }
+  if (normalizedStatus === 'DOWN' || normalizedStatus === 'ERROR') {
+    updatePayload.crawl_acknowledged = false;
   }
   const { error } = await supabase
     .from('sites')
