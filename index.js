@@ -471,6 +471,97 @@ app.post('/sites/:id/acknowledge', async (req, res) => {
   }
 });
 
+// 👇 NOUVEAU : suppression d'un site — cascade sur ses pages et leurs checks
+// avant de supprimer la ligne `sites` elle-même (pas de ON DELETE CASCADE
+// supposé côté Supabase, donc nettoyage manuel dans l'ordre FK).
+app.delete('/monitors/:id', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const siteId = req.params.id;
+  try {
+    const { data: pages, error: pagesError } = await supabase
+      .from('pages')
+      .select('id')
+      .eq('site_id', siteId);
+    if (pagesError) throw pagesError;
+
+    const pageIds = (pages || []).map(p => p.id);
+    if (pageIds.length > 0) {
+      const { error: checksError } = await supabase
+        .from('page_checks')
+        .delete()
+        .in('page_id', pageIds);
+      if (checksError) throw checksError;
+
+      const { error: deletePagesError } = await supabase
+        .from('pages')
+        .delete()
+        .eq('site_id', siteId);
+      if (deletePagesError) throw deletePagesError;
+    }
+
+    const { error: siteError } = await supabase
+      .from('sites')
+      .delete()
+      .eq('id', siteId);
+    if (siteError) throw siteError;
+
+    res.json({ success: true, deletedPages: pageIds.length });
+  } catch (err) {
+    console.error('[DELETE /monitors/:id] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 👇 NOUVEAU : pause/reprise/suppression d'une page individuelle, pour le
+// swipe sur un sous-élément dans l'app (n'affecte pas les autres pages du
+// même site ni le site lui-même).
+app.post('/pages/:id/pause', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const { error } = await supabase.from('pages').update({ is_active: false }).eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /pages/:id/pause] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/pages/:id/resume', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const { error } = await supabase.from('pages').update({ is_active: true }).eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /pages/:id/resume] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/pages/:id', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const pageId = req.params.id;
+  try {
+    const { error: checksError } = await supabase.from('page_checks').delete().eq('page_id', pageId);
+    if (checksError) throw checksError;
+    const { error: pageError } = await supabase.from('pages').delete().eq('id', pageId);
+    if (pageError) throw pageError;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[DELETE /pages/:id] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const DISCOVERY_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 SentinelSiteBot/1.0',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
