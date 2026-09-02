@@ -26,19 +26,14 @@ router.get('/push-tokens', async (req, res) => {
   });
 });
 
-router.get('/active-sites', async (req, res) => {
-  const { data, error } = await supabase
-    .from('sites')
-    // On ajoute crawl_interval_minutes et last_crawled_at pour que crawler.js
-    // puisse savoir si un site est "dû" ou non pour une nouvelle vérification.
-    .select('id, client_name, site_url, kuma_group_id, crawl_interval_minutes, last_crawled_at')
-    .eq('is_active', true)
-    .not('kuma_group_id', 'is', null);
-  if (error) {
-    return res.status(500).json({ success: false, error: 'Erreur lecture sites.' });
-  }
-  res.json({ success: true, sites: data });
-});
+// NOTE : la route GET /active-sites a été retirée d'ici (2026-09-02).
+// Elle faisait doublon avec celle définie dans index.js et prenait le dessus
+// dessus à cause de l'ordre d'enregistrement (`app.use(pushTokensRoutes)`
+// avant `app.get('/active-sites', ...)`). Sa dépendance à `kuma_group_id`
+// rendait invisibles pour OpenClaw/crawler.js tous les sites créés après la
+// migration hors de Kuma (qui n'ont plus de kuma_group_id). La seule version
+// de /active-sites qui doit rester active est celle d'index.js
+// (id, client_name, site_url — sans filtre Kuma).
 
 // Route appelée par le workflow OpenClaw juste après avoir testé un site,
 // pour enregistrer la date de dernier passage ET le rapport de vérification
@@ -46,7 +41,6 @@ router.get('/active-sites', async (req, res) => {
 router.post('/sites/:id/mark-crawled', async (req, res) => {
   const { id } = req.params;
   const { status, message } = req.body || {};
-
   const updatePayload = {
     last_crawled_at: new Date().toISOString(),
   };
@@ -56,7 +50,6 @@ router.post('/sites/:id/mark-crawled', async (req, res) => {
   if (message !== undefined) {
     updatePayload.last_crawl_report = message;
   }
-
   const { error } = await supabase
     .from('sites')
     .update(updatePayload)
@@ -68,13 +61,12 @@ router.post('/sites/:id/mark-crawled', async (req, res) => {
   res.json({ success: true });
 });
 
-// 👇 NOUVEAU : appelée par le script Playwright dédié (SSL + temps de
+// 👇 appelée par le script Playwright dédié (SSL + temps de
 // chargement de l'URL principale), lancé AVANT OpenClaw dans le workflow.
 // Remplace ce qu'on tirait auparavant de Kuma pour ces deux métriques.
 router.post('/sites/:id/update-metrics', async (req, res) => {
   const { id } = req.params;
   const { sslValidTo, sslDaysRemaining, sslIssuer, loadTimeMs } = req.body || {};
-
   const updatePayload = {
     metrics_checked_at: new Date().toISOString(),
   };
@@ -82,7 +74,6 @@ router.post('/sites/:id/update-metrics', async (req, res) => {
   if (sslDaysRemaining !== undefined) updatePayload.ssl_days_remaining = sslDaysRemaining;
   if (sslIssuer !== undefined) updatePayload.ssl_issuer = sslIssuer;
   if (loadTimeMs !== undefined) updatePayload.load_time_ms = loadTimeMs;
-
   const { error } = await supabase
     .from('sites')
     .update(updatePayload)
