@@ -34,34 +34,6 @@ function genPushToken(length = 32) {
   return token;
 }
 
-function withKuma(action) {
-  return new Promise((resolve, reject) => {
-    const socket = io(KUMA_URL, { transports: ['websocket'] });
-    socket.on('connect_error', (err) => {
-      socket.disconnect();
-      reject(new Error('connect_error: ' + err.message));
-    });
-    socket.on('connect', () => {
-      socket.emit('login', { username: KUMA_USER, password: KUMA_PASS }, (res) => {
-        if (!res.ok) {
-          socket.disconnect();
-          return reject(new Error('login failed: ' + res.msg));
-        }
-        action(socket, resolve, reject);
-      });
-    });
-  });
-}
-
-function createMonitorPromise(socket, data) {
-  return new Promise((resolve, reject) => {
-    socket.emit('add', data, (res) => {
-      if (!res.ok) reject(new Error(res.msg));
-      else resolve(res.monitorID ?? res.monitorId);
-    });
-  });
-}
-
 // ================================================================
 // LECTURE SUPABASE
 // ================================================================
@@ -77,6 +49,8 @@ async function buildMonitorsPayloadFromSupabase() {
       assignee,
       is_active,
       crawl_interval_minutes,
+      crawl_acknowledged,
+      last_crawl_status,
       ssl_valid_to,
       ssl_days_remaining,
       ssl_issuer,
@@ -129,6 +103,10 @@ async function buildMonitorsPayloadFromSupabase() {
       metricsCheckedAt: site.metrics_checked_at,
       assignee: site.assignee,
       lastCrawledAt: null,
+      // 👇 nouveau : état d'acquittement, utile pour afficher un badge
+      // "en attente de correction" côté app plutôt qu'un simple DOWN
+      crawlAcknowledged: site.crawl_acknowledged,
+      lastCrawlStatus: site.last_crawl_status,
     });
 
     const pages = site.pages || [];
@@ -208,6 +186,8 @@ async function getMonitorDetailFromSupabase(id, type) {
         assignee,
         is_active,
         crawl_interval_minutes,
+        crawl_acknowledged,
+        last_crawl_status,
         ssl_valid_to,
         ssl_days_remaining,
         ssl_issuer,
@@ -261,6 +241,8 @@ async function getMonitorDetailFromSupabase(id, type) {
       sslIssuer: site.ssl_issuer,
       loadTimeMs: site.load_time_ms,
       metricsCheckedAt: site.metrics_checked_at,
+      // 👇 nouveau
+      crawlAcknowledged: site.crawl_acknowledged,
     };
 
     const history = [];
@@ -325,7 +307,7 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     const { data: site } = await supabase
       .from('sites')
-      .select('client_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at')
+      .select('client_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at, crawl_acknowledged')
       .eq('id', page.site_id)
       .single();
 
@@ -364,6 +346,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       sslIssuer: site?.ssl_issuer || null,
       loadTimeMs: site?.load_time_ms || null,
       metricsCheckedAt: site?.metrics_checked_at || null,
+      crawlAcknowledged: site?.crawl_acknowledged ?? true,
     };
 
     const history = sortedChecks.map(c => ({
@@ -381,12 +364,18 @@ async function getMonitorDetailFromSupabase(id, type) {
 // ROUTES
 // ================================================================
 
+// 👇 MODIFIÉ : n'expose plus que les sites actifs ET dont le dernier crawl
+// DOWN a été acquitté (crawl_acknowledged = true). Un site DOWN non acquitté
+// disparaît de cette liste, donc le workflow OpenClaw (fetch-sites) ne le
+// re-testera plus tant qu'un humain n'a pas confirmé le fix via
+// POST /sites/:id/acknowledge.
 app.get('/active-sites', async (req, res) => {
   try {
     const { data: sites, error } = await supabase
       .from('sites')
       .select('id, client_name, site_url')
-      .eq('is_active', true);
+      .eq('is_active', true)
+      .or('crawl_acknowledged.is.null,crawl_acknowledged.eq.true');
 
     if (error) throw error;
     res.json({ success: true, sites: sites || [] });
@@ -424,107 +413,60 @@ app.get('/monitors/:id', async (req, res) => {
   res.json({ success: true, ...detail });
 });
 
-app.post('/sites/:id/pages-report', async (req, res) => {
+// 👇 NOUVEAU : pause/reprise réelle. Un site en pause disparaît de
+// /active-sites (filtre is_active déjà en place) donc OpenClaw ne le teste
+// plus. Remplace l'ancienne implémentation Kuma (retirée avec la migration).
+app.post('/monitors/:id/pause', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  const siteId = req.params.id;
-  const { pages } = req.body;
-
-  if (!Array.isArray(pages) || pages.length === 0) {
-    return res.status(400).json({ error: 'Le tableau "pages" est requis et non vide.' });
-  }
-
   try {
-    const { data: site, error: siteError } = await supabase
+    const { error } = await supabase
       .from('sites')
-      .select('id')
-      .eq('id', siteId)
-      .single();
-    if (siteError || !site) {
-      return res.status(404).json({ error: 'Site non trouvé.' });
-    }
-
-    for (const pageData of pages) {
-      let { data: existingPage } = await supabase
-        .from('pages')
-        .select('id')
-        .eq('site_id', siteId)
-        .eq('url', pageData.url)
-        .maybeSingle();
-
-      let pageId;
-      if (existingPage) {
-        pageId = existingPage.id;
-      } else {
-        const { data: newPage, error: insertError } = await supabase
-          .from('pages')
-          .insert({
-            site_id: siteId,
-            url: pageData.url,
-            name: pageData.name || pageData.url,
-            is_active: true,
-            discovered_dynamically: true,
-            kuma_monitor_id: null,
-          })
-          .select()
-          .single();
-        if (insertError) {
-          console.error('[pages-report] Erreur insertion page:', insertError);
-          continue;
-        }
-        pageId = newPage.id;
-      }
-
-      const checkData = {
-        page_id: pageId,
-        source: 'openclaw',
-        status: pageData.status?.toUpperCase() || 'UNKNOWN',
-        http_code: pageData.http_code || null,
-        response_time_ms: pageData.response_time_ms || null,
-        note: pageData.note || null,
-        checked_at: new Date().toISOString(),
-      };
-      const { error: checkError } = await supabase
-        .from('page_checks')
-        .insert(checkData);
-      if (checkError) {
-        console.error('[pages-report] Erreur insertion check:', checkError);
-      }
-    }
-
-    await supabase
-      .from('sites')
-      .update({ last_crawled_at: new Date().toISOString() })
-      .eq('id', siteId);
-
+      .update({ is_active: false })
+      .eq('id', req.params.id);
+    if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('[pages-report] Erreur:', err);
+    console.error('[POST /monitors/:id/pause] Erreur:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/sites/:id/mark-crawled', async (req, res) => {
+app.post('/monitors/:id/resume', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
-  const siteId = req.params.id;
-  const { status, message } = req.body;
-
   try {
-    await supabase
+    const { error } = await supabase
       .from('sites')
-      .update({
-        last_crawled_at: new Date().toISOString(),
-        last_crawl_status: status,
-        last_crawl_message: message,
-      })
-      .eq('id', siteId);
-
+      .update({ is_active: true })
+      .eq('id', req.params.id);
+    if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('[POST /mark-crawled] Erreur:', err);
+    console.error('[POST /monitors/:id/resume] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 👇 NOUVEAU : acquittement d'un site DOWN. À appeler depuis l'app quand
+// le dev confirme que le problème a été corrigé — repasse
+// crawl_acknowledged à true, ce qui refait réapparaître le site dans
+// /active-sites au prochain cycle OpenClaw.
+app.post('/sites/:id/acknowledge', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const { error } = await supabase
+      .from('sites')
+      .update({ crawl_acknowledged: true })
+      .eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /sites/:id/acknowledge] Erreur:', err);
     res.status(500).json({ error: err.message });
   }
 });
