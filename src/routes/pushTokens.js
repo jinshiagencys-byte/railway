@@ -40,13 +40,31 @@ router.get('/active-sites', async (req, res) => {
   res.json({ success: true, sites: data });
 });
 
-// Nouvelle route : appelée par crawler.js juste après avoir fini de vérifier
-// toutes les pages d'un site, pour enregistrer la date de dernier passage.
+// Route appelée par le workflow OpenClaw juste après avoir testé un site,
+// pour enregistrer la date de dernier passage ET le rapport de vérification
+// (statut global + détail par page). Avant, seul last_crawled_at était
+// écrit — status/message du body étaient reçus mais jamais persistés.
 router.post('/sites/:id/mark-crawled', async (req, res) => {
   const { id } = req.params;
+  const { status, message } = req.body || {};
+
+  // `status` : "UP" | "DOWN" | "ERROR" | "UNKNOWN" (voir workflow OpenClaw)
+  // `message` : soit un tableau structuré de pages (cas normal, voir task.md
+  // du workflow), soit une simple chaîne de repli — on stocke tel quel en
+  // JSONB, la normalisation à l'affichage se fait côté app.
+  const updatePayload = {
+    last_crawled_at: new Date().toISOString(),
+  };
+  if (typeof status === 'string' && status.length > 0) {
+    updatePayload.last_crawl_status = status.toUpperCase();
+  }
+  if (message !== undefined) {
+    updatePayload.last_crawl_report = message;
+  }
+
   const { error } = await supabase
     .from('sites')
-    .update({ last_crawled_at: new Date().toISOString() })
+    .update(updatePayload)
     .eq('id', id);
   if (error) {
     console.error('[mark-crawled] Supabase error:', error);
