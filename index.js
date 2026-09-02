@@ -73,12 +73,7 @@ function createMonitorPromise(socket, data) {
 //  HELPERS POUR LA LECTURE SUPABASE
 // ============================================================
 
-/**
- * Construit la liste des monitors (groupes + pages) à partir de Supabase.
- * Retourne { stats, monitors } au format attendu par l'app.
- */
 async function buildMonitorsPayloadFromSupabase() {
-  // Récupérer tous les sites actifs avec leurs pages et le dernier check de chaque page
   const { data: sites, error } = await supabase
     .from('sites')
     .select(`
@@ -121,7 +116,6 @@ async function buildMonitorsPayloadFromSupabase() {
 
   sites.forEach((site) => {
     // Groupe = le site lui-même
-    const groupStatus = 'pending'; // on calculera plus tard si besoin
     monitors.push({
       id: site.id,
       name: site.client_name,
@@ -129,30 +123,27 @@ async function buildMonitorsPayloadFromSupabase() {
       parent: null,
       parentName: null,
       active: site.is_active,
-      status: groupStatus,
+      status: 'pending', // on le calculera à partir des pages
       msg: null,
       time: null,
       url: site.site_url,
       avgPing: null,
       uptime24h: null,
       logoUrl: site.logo_url,
-      // on ajoute les champs métriques directement (pour le détail)
       sslValidTo: site.ssl_valid_to,
       sslDaysRemaining: site.ssl_days_remaining,
       sslIssuer: site.ssl_issuer,
       loadTimeMs: site.load_time_ms,
       metricsCheckedAt: site.metrics_checked_at,
       assignee: site.assignee,
-      lastCrawledAt: null, // on ne stocke pas sur le groupe, on le mettra sur les pages
+      lastCrawledAt: null,
     });
 
     // Pages enfants
     const pages = site.pages || [];
+    let anyDown = false;
     pages.forEach((page) => {
-      // Prendre le dernier check (le plus récent)
       const checks = page.page_checks || [];
-      const lastCheck = checks.length > 0 ? checks[0] : null; // trié par checked_at desc grâce à l'order by dans la requête ? On va trier manuellement
-      // On va trier les checks par checked_at desc
       const sortedChecks = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
       const latest = sortedChecks[0] || null;
 
@@ -162,7 +153,7 @@ async function buildMonitorsPayloadFromSupabase() {
       } else if (latest) {
         const s = latest.status?.toUpperCase();
         if (s === 'UP') status = 'up';
-        else if (s === 'DOWN' || s === 'ERROR') status = 'down';
+        else if (s === 'DOWN' || s === 'ERROR') { status = 'down'; anyDown = true; }
         else status = 'pending';
       }
 
@@ -177,10 +168,9 @@ async function buildMonitorsPayloadFromSupabase() {
         msg: latest?.note || null,
         time: latest?.checked_at || null,
         url: page.url,
-        avgPing: latest?.response_time_ms ?? null, // on peut utiliser ce champ pour le temps de réponse
-        uptime24h: null, // à calculer plus tard si besoin
+        avgPing: latest?.response_time_ms ?? null,
+        uptime24h: null,
         logoUrl: site.logo_url,
-        // on ajoute aussi les métriques du site pour le détail
         sslValidTo: site.ssl_valid_to,
         sslDaysRemaining: site.ssl_days_remaining,
         sslIssuer: site.ssl_issuer,
@@ -188,30 +178,38 @@ async function buildMonitorsPayloadFromSupabase() {
         metricsCheckedAt: site.metrics_checked_at,
         assignee: site.assignee,
         lastCrawledAt: latest?.checked_at || null,
-        // on pourrait ajouter le code HTTP dans msg ou ailleurs
       };
       monitors.push(monitorItem);
 
-      // Mettre à jour les stats globales
       if (status !== 'paused') {
         if (stats[status] !== undefined) stats[status] += 1;
       } else {
         stats.paused += 1;
       }
     });
+
+    // Mettre à jour le statut du groupe (si une page est down, le groupe est down)
+    const groupMonitor = monitors.find(m => m.id === site.id && m.type === 'group');
+    if (groupMonitor) {
+      groupMonitor.status = anyDown ? 'down' : (pages.length > 0 ? 'up' : 'pending');
+      // Prendre le dernier check de la première page pour l'heure
+      if (pages.length > 0) {
+        const firstPage = pages[0];
+        const checks = firstPage.page_checks || [];
+        const sorted = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
+        if (sorted.length > 0) {
+          groupMonitor.time = sorted[0].checked_at;
+          groupMonitor.msg = sorted[0].note || null;
+        }
+      }
+    }
   });
 
   return { stats, monitors };
 }
 
-/**
- * Récupère le détail d'un monitor (site ou page) depuis Supabase.
- * @param {string|number} id - ID du monitor (soit id de site, soit id de page)
- * @param {string} type - 'group' ou 'http'
- */
 async function getMonitorDetailFromSupabase(id, type) {
   if (type === 'group') {
-    // C'est un site
     const { data: site, error } = await supabase
       .from('sites')
       .select(`
@@ -245,11 +243,8 @@ async function getMonitorDetailFromSupabase(id, type) {
       .eq('id', id)
       .single();
 
-    if (error || !site) {
-      return null;
-    }
+    if (error || !site) return null;
 
-    // Construire l'objet monitor (groupe)
     const monitor = {
       id: site.id,
       name: site.client_name,
@@ -262,7 +257,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       parent: null,
       parentName: null,
       active: site.is_active,
-      status: 'pending', // on calculera plus tard
+      status: 'pending',
       msg: null,
       lastCheckedAt: null,
       uptime24h: null,
@@ -270,8 +265,8 @@ async function getMonitorDetailFromSupabase(id, type) {
       logoUrl: site.logo_url,
       clientName: site.client_name,
       assignee: site.assignee,
-      lastCrawlStatus: null, // on peut déduire du dernier check
-      lastCrawlReport: null,  // on peut construire à partir des pages
+      lastCrawlStatus: null,
+      lastCrawlReport: null,
       lastCrawledAt: null,
       sslValidTo: site.ssl_valid_to,
       sslDaysRemaining: site.ssl_days_remaining,
@@ -280,18 +275,13 @@ async function getMonitorDetailFromSupabase(id, type) {
       metricsCheckedAt: site.metrics_checked_at,
     };
 
-    // Historique : on prend tous les checks de toutes les pages et on les fusionne
     const history = [];
     const pages = site.pages || [];
+    let anyDown = false;
     pages.forEach((page) => {
       const checks = page.page_checks || [];
       checks.forEach((check) => {
-        const statusMap = {
-          'UP': 'up',
-          'DOWN': 'down',
-          'ERROR': 'down',
-          'UNKNOWN': 'pending'
-        };
+        const statusMap = { 'UP': 'up', 'DOWN': 'down', 'ERROR': 'down', 'UNKNOWN': 'pending' };
         const status = statusMap[check.status?.toUpperCase()] || 'pending';
         history.push({
           status,
@@ -299,30 +289,27 @@ async function getMonitorDetailFromSupabase(id, type) {
           ping: check.response_time_ms ?? null,
           msg: check.note || `HTTP ${check.http_code ?? '?'}`,
         });
+        if (status === 'down') anyDown = true;
       });
     });
-    // Trier par temps décroissant
     history.sort((a, b) => new Date(b.time) - new Date(a.time));
 
-    // Déterminer le statut global du groupe (si au moins une page down -> down, sinon up)
-    const latestChecks = pages.map(p => (p.page_checks || [])[0]).filter(Boolean);
-    const anyDown = latestChecks.some(c => c.status?.toUpperCase() === 'DOWN' || c.status?.toUpperCase() === 'ERROR');
-    monitor.status = anyDown ? 'down' : (latestChecks.length > 0 ? 'up' : 'pending');
-    monitor.lastCheckedAt = latestChecks.length > 0 ? latestChecks[0].checked_at : null;
-    // lastCrawlStatus: on prend le statut global
+    monitor.status = anyDown ? 'down' : (history.length > 0 ? 'up' : 'pending');
+    monitor.lastCheckedAt = history.length > 0 ? history[0].time : null;
     monitor.lastCrawlStatus = anyDown ? 'DOWN' : 'UP';
-    // lastCrawlReport: on construit un tableau à partir des pages
     monitor.lastCrawlReport = pages.map(p => {
-      const check = (p.page_checks || [])[0];
+      const checks = p.page_checks || [];
+      const sorted = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
+      const latest = sorted[0] || null;
       return {
         url: p.url,
-        status: check?.status?.toUpperCase() || 'UNKNOWN',
-        http_code: check?.http_code ?? null,
+        status: latest?.status?.toUpperCase() || 'UNKNOWN',
+        http_code: latest?.http_code ?? null,
         action_tested: null,
-        note: check?.note || null,
+        note: latest?.note || null,
       };
     });
-    monitor.lastCrawledAt = latestChecks.length > 0 ? latestChecks[0].checked_at : null;
+    monitor.lastCrawledAt = history.length > 0 ? history[0].time : null;
 
     return { monitor, history };
   } else {
@@ -349,7 +336,6 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     if (error || !page) return null;
 
-    // Récupérer le site parent pour les métriques partagées
     const { data: site, error: siteErr } = await supabase
       .from('sites')
       .select('client_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at')
@@ -360,12 +346,7 @@ async function getMonitorDetailFromSupabase(id, type) {
     const sortedChecks = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
     const latest = sortedChecks[0] || null;
 
-    const statusMap = {
-      'UP': 'up',
-      'DOWN': 'down',
-      'ERROR': 'down',
-      'UNKNOWN': 'pending'
-    };
+    const statusMap = { 'UP': 'up', 'DOWN': 'down', 'ERROR': 'down', 'UNKNOWN': 'pending' };
     const status = latest ? (statusMap[latest.status?.toUpperCase()] || 'pending') : 'pending';
 
     const monitor = {
@@ -389,7 +370,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       clientName: site?.client_name || null,
       assignee: site?.assignee || null,
       lastCrawlStatus: latest?.status?.toUpperCase() || null,
-      lastCrawlReport: null, // pas applicable pour une page
+      lastCrawlReport: null,
       lastCrawledAt: latest?.checked_at || null,
       sslValidTo: site?.ssl_valid_to || null,
       sslDaysRemaining: site?.ssl_days_remaining || null,
@@ -398,7 +379,6 @@ async function getMonitorDetailFromSupabase(id, type) {
       metricsCheckedAt: site?.metrics_checked_at || null,
     };
 
-    // Historique : les checks de cette page
     const history = sortedChecks.map(c => ({
       status: statusMap[c.status?.toUpperCase()] || 'pending',
       time: c.checked_at,
@@ -411,10 +391,9 @@ async function getMonitorDetailFromSupabase(id, type) {
 }
 
 // ============================================================
-//  ROUTES PUBLIQUES (inchangées sauf GET)
+//  ROUTES DE LECTURE (Supabase)
 // ============================================================
 
-// --- GET /monitors (remplacé par Supabase) ---
 app.get('/monitors', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -428,13 +407,11 @@ app.get('/monitors', async (req, res) => {
   }
 });
 
-// --- GET /monitors/:id (remplacé par Supabase) ---
 app.get('/monitors/:id', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
   const id = req.params.id;
-  // On ne sait pas si c'est un site ou une page. On essaie d'abord comme site, puis comme page.
   let detail = await getMonitorDetailFromSupabase(id, 'group');
   if (!detail) {
     detail = await getMonitorDetailFromSupabase(id, 'http');
@@ -446,8 +423,7 @@ app.get('/monitors/:id', async (req, res) => {
 });
 
 // ============================================================
-//  NOUVELLE ROUTE : /sites/:id/pages-report
-//  Reçoit le rapport OpenClaw et l'enregistre dans pages & page_checks
+//  ROUTE : /sites/:id/pages-report (OpenClaw)
 // ============================================================
 
 app.post('/sites/:id/pages-report', async (req, res) => {
@@ -455,14 +431,13 @@ app.post('/sites/:id/pages-report', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
   const siteId = req.params.id;
-  const { pages } = req.body; // tableau d'objets: { url, status, http_code, note, response_time_ms? }
+  const { pages } = req.body;
 
   if (!Array.isArray(pages) || pages.length === 0) {
     return res.status(400).json({ error: 'Le tableau "pages" est requis et non vide.' });
   }
 
   try {
-    // Vérifier que le site existe
     const { data: site, error: siteError } = await supabase
       .from('sites')
       .select('id')
@@ -472,9 +447,7 @@ app.post('/sites/:id/pages-report', async (req, res) => {
       return res.status(404).json({ error: 'Site non trouvé.' });
     }
 
-    // Pour chaque page, insérer ou mettre à jour
     for (const pageData of pages) {
-      // Essayer de trouver la page existante par url
       let { data: existingPage, error: findError } = await supabase
         .from('pages')
         .select('id')
@@ -485,10 +458,7 @@ app.post('/sites/:id/pages-report', async (req, res) => {
       let pageId;
       if (existingPage) {
         pageId = existingPage.id;
-        // Mise à jour éventuelle du nom, is_active, etc.
-        // On ne met pas à jour le nom si déjà présent
       } else {
-        // Créer la page
         const { data: newPage, error: insertError } = await supabase
           .from('pages')
           .insert({
@@ -496,8 +466,8 @@ app.post('/sites/:id/pages-report', async (req, res) => {
             url: pageData.url,
             name: pageData.name || pageData.url,
             is_active: true,
-            discovered_dynamically: false,
-            kuma_monitor_id: null, // on ne lie pas à Kuma pour le moment
+            discovered_dynamically: true,
+            kuma_monitor_id: null,
           })
           .select()
           .single();
@@ -508,7 +478,6 @@ app.post('/sites/:id/pages-report', async (req, res) => {
         pageId = newPage.id;
       }
 
-      // Insérer le check dans page_checks
       const checkData = {
         page_id: pageId,
         source: 'openclaw',
@@ -526,32 +495,10 @@ app.post('/sites/:id/pages-report', async (req, res) => {
       }
     }
 
-    // Mettre à jour le site avec la date du dernier crawl et éventuellement le statut global
-    // On peut aussi mettre à jour last_crawl_status et last_crawl_report sur le site pour compatibilité
-    // On va calculer un statut global : si une page est DOWN ou ERROR, global DOWN, sinon UP
-    const { data: allPages, error: pagesError } = await supabase
-      .from('pages')
-      .select('id')
-      .eq('site_id', siteId);
-
-    if (!pagesError && allPages && allPages.length > 0) {
-      // Récupérer les derniers checks de chaque page
-      const pageIds = allPages.map(p => p.id);
-      const { data: latestChecks, error: checksError } = await supabase
-        .from('page_checks')
-        .select('page_id, status')
-        .in('page_id', pageIds)
-        .order('checked_at', { ascending: false })
-        .limit(1); // on ne peut pas faire de distinct par page facilement, on va faire plusieurs requêtes ou utiliser une fonction. Pour simplifier, on ne met pas à jour last_crawl_status global ici.
-    }
-
-    // On met à jour last_crawled_at
+    // Mettre à jour last_crawled_at du site
     await supabase
       .from('sites')
-      .update({
-        last_crawled_at: new Date().toISOString(),
-        // on peut aussi mettre à jour last_crawl_status en calculant
-      })
+      .update({ last_crawled_at: new Date().toISOString() })
       .eq('id', siteId);
 
     res.json({ success: true });
@@ -562,17 +509,423 @@ app.post('/sites/:id/pages-report', async (req, res) => {
 });
 
 // ============================================================
-//  ROUTES DE CRÉATION (inchangées, utilisent Kuma)
+//  HELPERS DE DÉCOUVERTE DE PAGES (pour les routes de création)
 // ============================================================
 
-// ... (code inchangé pour /create-monitor, /discover-pages, /create-monitor-group, /pause, /resume, /delete, /debug, /backfill-logos, /health)
+const DISCOVERY_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 SentinelSiteBot/1.0',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+};
 
-// On va copier ces routes telles quelles depuis l'ancien index.js, sauf qu'on va supprimer les références aux caches Kuma dans /pause, /resume, /delete (ils n'ont pas besoin de mettre à jour le cache). On peut les laisser.
+async function fetchSitemapPages(baseUrl) {
+  const sitemapUrl = new URL('/sitemap.xml', baseUrl).toString();
+  const { data } = await axios.get(sitemapUrl, { timeout: 8000, headers: DISCOVERY_HEADERS });
+  const parsed = await parseStringPromise(data);
+  const urls = parsed?.urlset?.url?.map((u) => u.loc[0]) || [];
+  return urls.map((u) => ({ url: u, name: null }));
+}
 
-// Je vais réécrire les routes en les gardant, mais sans la gestion du cache (on ne supprime plus du cache, car on ne l'utilise plus).
+async function fetchCrawlFallback(baseUrl) {
+  const { data, request } = await axios.get(baseUrl, { timeout: 8000, headers: DISCOVERY_HEADERS });
+  const $ = cheerio.load(data);
+  const finalUrl = request?.res?.responseUrl || baseUrl;
+  const origin = new URL(finalUrl).origin;
+  const found = new Set();
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href');
+    try {
+      const abs = new URL(href, finalUrl).toString();
+      if (abs.startsWith(origin)) found.add(abs.split('#')[0]);
+    } catch (_) {}
+  });
+  return [...found].map((u) => ({ url: u, name: null }));
+}
+
+function parseFrequencyHours(frequency) {
+  const hours = Number(frequency);
+  if (!frequency || Number.isNaN(hours) || hours <= 0) {
+    return DEFAULT_FREQUENCY_HOURS;
+  }
+  return hours;
+}
 
 // ============================================================
-//  SOCKET.IO POUR L'APP (temps réel)
+//  ROUTES DE CRÉATION
+// ============================================================
+
+app.post('/create-monitor', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const { name, url, assignee, frequency } = req.body;
+  if (!url) return res.status(400).json({ error: 'url is required' });
+
+  const frequencyHours = parseFrequencyHours(frequency);
+  const intervalSeconds = Math.round(frequencyHours * 3600);
+  const logoUrl = await getSiteLogoUrl(url);
+
+  try {
+    const { data: siteRow, error: siteInsertError } = await supabase
+      .from('sites')
+      .insert({
+        client_name: name || url,
+        site_url: url,
+        logo_url: logoUrl,
+        assignee: assignee || null,
+        is_active: true,
+        crawl_interval_minutes: Math.round(frequencyHours * 60),
+      })
+      .select()
+      .single();
+
+    if (siteInsertError) {
+      console.error('[create-monitor] Supabase site insert error:', siteInsertError);
+    }
+
+    const result = await withKuma((socket, resolve, reject) => {
+      socket.emit('add', {
+        type: 'http',
+        name: name || url,
+        url,
+        interval: intervalSeconds,
+        retryInterval: intervalSeconds,
+        maxretries: 3,
+        method: 'GET',
+        accepted_statuscodes: ['200-299'],
+        notificationIDList: {}
+      }, async (addRes) => {
+        socket.disconnect();
+        if (!addRes.ok) return reject(new Error(addRes.msg));
+        const monitorId = addRes.monitorID ?? addRes.monitorId;
+        if (siteRow?.id) {
+          await supabase
+            .from('sites')
+            .update({ kuma_group_id: monitorId })
+            .eq('id', siteRow.id);
+        }
+        resolve({ ...addRes, monitorId });
+      });
+    });
+
+    res.json({ success: true, monitorId: result.monitorId, msg: result.msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/discover-pages', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'url is required' });
+
+  try {
+    let pages = await fetchSitemapPages(url).catch((err) => {
+      console.warn('[discover-pages] sitemap échoué pour', url, ':', err.message);
+      return [];
+    });
+    if (pages.length === 0) {
+      pages = await fetchCrawlFallback(url).catch((err) => {
+        console.warn('[discover-pages] crawl fallback échoué pour', url, ':', err.message);
+        return [];
+      });
+    }
+    res.json({ success: true, pages });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/create-monitor-group', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { clientName, siteUrl, assignee, groupName, pages, frequency, apiEndpoints } = req.body;
+
+  if (!clientName || !siteUrl || !groupName) {
+    return res.status(400).json({
+      error: 'clientName, siteUrl et groupName sont requis',
+    });
+  }
+
+  let effectivePages = Array.isArray(pages) ? pages : [];
+  if (effectivePages.length === 0) {
+    console.warn('[create-monitor-group] aucune page découverte pour', siteUrl, '- fallback sur la page d\'accueil');
+    effectivePages = [{ url: siteUrl, name: clientName || siteUrl }];
+  }
+
+  const frequencyHours = parseFrequencyHours(frequency);
+  const intervalSeconds = Math.round(frequencyHours * 3600);
+  const logoUrl = await getSiteLogoUrl(siteUrl);
+
+  // --- Étape 1 : créer la ligne "sites" dans Supabase ---
+  const { data: siteRow, error: siteInsertError } = await supabase
+    .from('sites')
+    .insert({
+      client_name: clientName,
+      site_url: siteUrl,
+      logo_url: logoUrl,
+      assignee: assignee || null,
+      is_active: true,
+      crawl_interval_minutes: Math.round(frequencyHours * 60),
+    })
+    .select()
+    .single();
+
+  if (siteInsertError) {
+    console.error('[create-monitor-group] Supabase site insert error:', siteInsertError);
+    return res.status(500).json({ error: "Échec de l'enregistrement du site." });
+  }
+
+  const siteId = siteRow.id;
+
+  // --- Étape 2 : création du groupe et des monitors (pages + APIs) via Kuma ---
+  try {
+    const result = await withKuma(async (socket, resolve, reject) => {
+      // 2.1 Créer le groupe
+      const groupId = await createMonitorPromise(socket, {
+        type: 'group',
+        name: groupName,
+        interval: intervalSeconds,
+        retryInterval: intervalSeconds,
+        accepted_statuscodes: ['200-299'],
+        notificationIDList: {},
+      });
+
+      // 2.2 Lier kuma_group_id à la ligne "sites"
+      await supabase
+        .from('sites')
+        .update({ kuma_group_id: groupId })
+        .eq('id', siteId);
+
+      // 2.3 Créer les monitors pour les pages (push)
+      const pagePromises = effectivePages.map(async (page) => {
+        const pushToken = genPushToken();
+        const monitorId = await createMonitorPromise(socket, {
+          type: 'push',
+          name: page.name || page.url,
+          parent: groupId,
+          interval: intervalSeconds,
+          accepted_statuscodes: ['200-299'],
+          notificationIDList: {},
+          pushToken,
+        });
+        return { type: 'page', monitorId, url: page.url, name: page.name || page.url, pushToken };
+      });
+
+      // 2.4 Créer les monitors pour les APIs (http)
+      const apiPromises = (apiEndpoints || []).map(async (endpoint) => {
+        const monitorId = await createMonitorPromise(socket, {
+          type: 'http',
+          name: endpoint.name || endpoint.url,
+          url: endpoint.url,
+          interval: intervalSeconds,
+          retryInterval: intervalSeconds,
+          maxretries: 3,
+          method: 'GET',
+          accepted_statuscodes: ['200-299'],
+          notificationIDList: {},
+        });
+        return { type: 'api', monitorId, url: endpoint.url, name: endpoint.name || endpoint.url };
+      });
+
+      const allResults = await Promise.all([...pagePromises, ...apiPromises]);
+
+      socket.disconnect();
+      resolve({ groupId, allResults });
+    });
+
+    // --- Étape 3 : enregistrer les résultats dans Supabase ---
+    const pageResults = result.allResults.filter(r => r.type === 'page');
+    const apiResults = result.allResults.filter(r => r.type === 'api');
+
+    // Pages → push_tokens
+    if (pageResults.length > 0) {
+      const pushTokenRows = pageResults.map(p => ({
+        group_id: result.groupId,
+        monitor_id: p.monitorId,
+        url: p.url,
+        name: p.name,
+        push_token: p.pushToken,
+        site_id: siteId,
+      }));
+      const { error: insertTokensError } = await supabase
+        .from('push_tokens')
+        .insert(pushTokenRows);
+      if (insertTokensError) {
+        console.error('[create-monitor-group] Supabase push_tokens insert error:', insertTokensError);
+      }
+
+      // 👇 INSÉRER AUSSI DANS LA TABLE `pages`
+      const pageRows = pageResults.map(p => ({
+        site_id: siteId,
+        url: p.url,
+        name: p.name,
+        is_active: true,
+        discovered_dynamically: false,
+        kuma_monitor_id: p.monitorId,
+      }));
+      const { error: insertPagesError } = await supabase
+        .from('pages')
+        .insert(pageRows);
+      if (insertPagesError) {
+        console.error('[create-monitor-group] Supabase pages insert error:', insertPagesError);
+      }
+    }
+
+    // APIs → api_endpoints
+    if (apiResults.length > 0) {
+      const apiRows = apiResults.map(a => ({
+        site_id: siteId,
+        monitor_id: a.monitorId,
+        url: a.url,
+        name: a.name,
+      }));
+      const { error: insertApiError } = await supabase
+        .from('api_endpoints')
+        .insert(apiRows);
+      if (insertApiError) {
+        console.error('[create-monitor-group] Supabase api_endpoints insert error:', insertApiError);
+      }
+    }
+
+    res.json({
+      success: true,
+      siteId,
+      groupId: result.groupId,
+      created: result.allResults.map(r => r.monitorId),
+      errors: [],
+    });
+
+  } catch (err) {
+    console.error('[create-monitor-group] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/monitors/:id/pause', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const id = req.params.id;
+  try {
+    const result = await withKuma((socket, resolve, reject) => {
+      socket.emit('pauseMonitor', id, (pauseRes) => {
+        socket.disconnect();
+        if (!pauseRes?.ok) return reject(new Error(pauseRes?.msg || 'échec pause'));
+        resolve(pauseRes);
+      });
+    });
+    res.json({ success: true, msg: result.msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/monitors/:id/resume', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const id = req.params.id;
+  try {
+    const result = await withKuma((socket, resolve, reject) => {
+      socket.emit('resumeMonitor', id, (resumeRes) => {
+        socket.disconnect();
+        if (!resumeRes?.ok) return reject(new Error(resumeRes?.msg || 'échec resume'));
+        resolve(resumeRes);
+      });
+    });
+    res.json({ success: true, msg: result.msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/monitors/:id', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const id = req.params.id;
+  const numericId = Number(id);
+  try {
+    const result = await withKuma((socket, resolve, reject) => {
+      socket.emit('deleteMonitor', id, (deleteRes) => {
+        socket.disconnect();
+        if (!deleteRes?.ok) return reject(new Error(deleteRes?.msg || 'échec suppression'));
+        resolve(deleteRes);
+      });
+    });
+
+    // Nettoyage Supabase
+    try {
+      const { data: siteMatch } = await supabase
+        .from('sites')
+        .select('id')
+        .eq('kuma_group_id', numericId)
+        .maybeSingle();
+
+      if (siteMatch?.id) {
+        await supabase.from('sites').delete().eq('id', siteMatch.id);
+      } else {
+        await supabase.from('push_tokens').delete().eq('monitor_id', numericId);
+        await supabase.from('api_endpoints').delete().eq('monitor_id', numericId);
+        await supabase.from('pages').delete().eq('kuma_monitor_id', numericId);
+      }
+    } catch (cleanupErr) {
+      console.error('[delete-monitor] erreur nettoyage Supabase:', cleanupErr);
+    }
+
+    res.json({ success: true, msg: result.msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+//  ROUTES DIVERSES
+// ============================================================
+
+app.get('/debug/kuma-cache', (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  res.json({ message: 'Cache Kuma désactivé, lecture Supabase uniquement.' });
+});
+
+app.post('/backfill-logos', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    const { data: sites, error } = await supabase
+      .from('sites')
+      .select('id, site_url, logo_url')
+      .is('logo_url', null);
+
+    if (error) throw error;
+
+    const results = [];
+    for (const site of sites || []) {
+      const logoUrl = await getSiteLogoUrl(site.site_url);
+      const { error: updateError } = await supabase
+        .from('sites')
+        .update({ logo_url: logoUrl })
+        .eq('id', site.id);
+      results.push({ id: site.id, site_url: site.site_url, logoUrl, ok: !updateError });
+    }
+
+    res.json({ success: true, updated: results.length, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// ============================================================
+//  SOCKET.IO (temps réel basé sur Supabase)
 // ============================================================
 
 const PORT = process.env.PORT || 3000;
@@ -589,7 +942,6 @@ ioServer.use((socket, next) => {
   next();
 });
 
-// Broadcast périodique des données Supabase
 let broadcastInterval = null;
 
 function startBroadcast() {
@@ -601,12 +953,11 @@ function startBroadcast() {
     } catch (err) {
       console.error('[broadcast] Erreur:', err);
     }
-  }, 5000); // toutes les 5 secondes
+  }, 5000);
 }
 
 ioServer.on('connection', async (socket) => {
   console.log('[ws] client connecté:', socket.id);
-  // Envoyer les données initiales
   try {
     const payload = await buildMonitorsPayloadFromSupabase();
     socket.emit('monitors:update', payload);
@@ -618,7 +969,6 @@ ioServer.on('connection', async (socket) => {
   });
 });
 
-// Démarrer le broadcast
 startBroadcast();
 
 server.listen(PORT, () => console.log(`Relay listening on ${PORT}`));
