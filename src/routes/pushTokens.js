@@ -74,6 +74,141 @@ router.post('/sites/:id/mark-crawled', async (req, res) => {
   res.json({ success: true });
 });
 
+// 👇 NOUVEAU : route appelée par le workflow OpenClaw juste après
+// "mark-crawled", avec le détail structuré par page produit par l'agent
+// (bloc JSON `{ pages: [...] }` extrait de task.md). C'est cette route qui
+// manquait — sans elle, `pages.last_status` / `page_checks` n'étaient
+// jamais mis à jour, donc l'app mobile (buildMonitorsPayloadFromSupabase /
+// getMonitorDetailFromSupabase) ne voyait jamais les statuts par page ni
+// les incidents (computeRecentIncidents), même quand mark-crawled recevait
+// bien le statut global.
+//
+// Pour chaque entrée de `pages` :
+//  - upsert dans `pages` par (site_id, url) — même logique que
+//    /sites/:id/pages/update-metrics : si la page existe déjà (créée via
+//    /create-monitor-group ou /create-monitor), on met à jour ses colonnes
+//    de statut ; sinon on la crée à la volée avec discovered_dynamically:true
+//  - insertion d'une ligne dans `page_checks` (historique), pour alimenter
+//    l'uptime et les incidents groupés par computeRecentIncidents()
+//
+// Comportement d'acquittement : on s'aligne sur mark-crawled — si au moins
+// une page est DOWN/ERROR, on repasse sites.crawl_acknowledged à false
+// (idempotent avec ce que mark-crawled fait déjà au niveau du site), pour
+// que le site et ses pages ne puissent jamais se retrouver dans un état
+// incohérent (site "acquitté" alors qu'une page individuelle est DOWN).
+router.post('/sites/:id/pages-report', async (req, res) => {
+  const { id } = req.params;
+  const { pages } = req.body || {};
+
+  if (!Array.isArray(pages) || pages.length === 0) {
+    return res.status(400).json({ success: false, error: 'pages (tableau non vide) requis.' });
+  }
+
+  const checkedAt = new Date().toISOString();
+  const results = [];
+  const errors = [];
+  let anyDown = false;
+
+  for (const p of pages) {
+    const url = typeof p?.url === 'string' ? p.url.trim() : '';
+    if (!url) {
+      errors.push('Entrée ignorée : url manquante ou invalide.');
+      continue;
+    }
+
+    const status = typeof p.status === 'string' ? p.status.toUpperCase() : 'UNKNOWN';
+    const httpCode = p.http_code !== undefined && p.http_code !== null ? Number(p.http_code) : null;
+    const note = typeof p.note === 'string' ? p.note : null;
+
+    if (status === 'DOWN' || status === 'ERROR') {
+      anyDown = true;
+    }
+
+    const pagePayload = {
+      last_status: status,
+      last_http_code: Number.isNaN(httpCode) ? null : httpCode,
+      last_note: note,
+      last_checked_at: checkedAt,
+    };
+
+    const { data: existing, error: findError } = await supabase
+      .from('pages')
+      .select('id')
+      .eq('site_id', id)
+      .eq('url', url)
+      .maybeSingle();
+
+    if (findError) {
+      console.error('[pages-report] Erreur recherche page:', url, findError);
+      errors.push(`${url}: ${findError.message}`);
+      continue;
+    }
+
+    let pageId = existing?.id;
+
+    if (existing) {
+      const { error: updateError } = await supabase
+        .from('pages')
+        .update(pagePayload)
+        .eq('id', existing.id);
+      if (updateError) {
+        console.error('[pages-report] Erreur mise à jour page:', url, updateError);
+        errors.push(`${url}: ${updateError.message}`);
+        continue;
+      }
+    } else {
+      const { data: inserted, error: insertError } = await supabase
+        .from('pages')
+        .insert({
+          site_id: id,
+          url,
+          name: url,
+          is_active: true,
+          discovered_dynamically: true,
+          ...pagePayload,
+        })
+        .select('id')
+        .single();
+      if (insertError) {
+        console.error('[pages-report] Erreur création page:', url, insertError);
+        errors.push(`${url}: ${insertError.message}`);
+        continue;
+      }
+      pageId = inserted.id;
+    }
+
+    const { error: checkError } = await supabase
+      .from('page_checks')
+      .insert({
+        page_id: pageId,
+        status,
+        http_code: Number.isNaN(httpCode) ? null : httpCode,
+        note,
+        checked_at: checkedAt,
+      });
+
+    if (checkError) {
+      console.error('[pages-report] Erreur insertion page_checks:', url, checkError);
+      errors.push(`${url} (historique): ${checkError.message}`);
+      continue;
+    }
+
+    results.push({ url, status, pageId });
+  }
+
+  if (anyDown) {
+    const { error: siteError } = await supabase
+      .from('sites')
+      .update({ crawl_acknowledged: false })
+      .eq('id', id);
+    if (siteError) {
+      console.error('[pages-report] Erreur mise à jour crawl_acknowledged:', siteError);
+    }
+  }
+
+  res.json({ success: errors.length === 0, updated: results, errors: errors.length ? errors : undefined });
+});
+
 // 👇 appelée par le script Playwright dédié (SSL + temps de
 // chargement de l'URL principale), lancé AVANT OpenClaw dans le workflow.
 // Remplace ce qu'on tirait auparavant de Kuma pour ces deux métriques.
@@ -101,15 +236,16 @@ router.post('/sites/:id/update-metrics', async (req, res) => {
   res.json({ success: true });
 });
 
-// 👇 NOUVEAU : métriques SSL + temps de chargement PAR PAGE, appelée par
+// 👇 métriques SSL + temps de chargement PAR PAGE, appelée par
 // check-metrics.js une fois pour chaque page listée dans pages.json (le
 // rapport structuré produit par OpenClaw après sa patrouille), en plus de
 // la page principale. Upsert par (site_id, url) : si la page existe déjà
-// (créée via /create-monitor-group ou /create-monitor), on met juste à
-// jour ses colonnes métriques ; sinon (page découverte dynamiquement par
-// OpenClaw pendant sa patrouille, absente de la liste initiale), on la
-// crée à la volée avec discovered_dynamically=true, comme le fait déjà
-// /pages-report pour le statut UP/DOWN.
+// (créée via /create-monitor-group ou /create-monitor, ou par
+// /pages-report ci-dessus), on met juste à jour ses colonnes métriques ;
+// sinon (page découverte dynamiquement par OpenClaw pendant sa patrouille,
+// absente de la liste initiale), on la crée à la volée avec
+// discovered_dynamically=true, comme le fait déjà /pages-report pour le
+// statut UP/DOWN.
 //
 // Nécessite les colonnes ssl_valid_to / ssl_days_remaining / ssl_issuer /
 // load_time_ms / metrics_checked_at sur la table `pages` (migration SQL à
