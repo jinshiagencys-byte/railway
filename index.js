@@ -44,6 +44,7 @@ async function buildMonitorsPayloadFromSupabase() {
     .select(`
       id,
       client_name,
+      group_name,
       site_url,
       logo_url,
       assignee,
@@ -81,7 +82,12 @@ async function buildMonitorsPayloadFromSupabase() {
   sites.forEach((site) => {
     monitors.push({
       id: site.id,
-      name: site.client_name,
+      // 👇 MODIFIÉ : name = group_name (nom du groupe), distinct de
+      // client_name désormais stocké séparément (voir clientName plus bas
+      // pour les monitors de type page ; les monitors de type group
+      // n'exposent pas encore clientName dans MonitorItem — seulement
+      // MonitorDetail).
+      name: site.group_name || site.client_name,
       type: 'group',
       parent: null,
       parentName: null,
@@ -127,7 +133,9 @@ async function buildMonitorsPayloadFromSupabase() {
         name: page.name || page.url,
         type: 'http',
         parent: site.id,
-        parentName: site.client_name,
+        // 👇 MODIFIÉ : parentName = group_name (nom du groupe parent),
+        // distinct du client_name affiché séparément côté détail.
+        parentName: site.group_name || site.client_name,
         active: page.is_active,
         status,
         msg: page.last_note || null,
@@ -177,6 +185,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       .select(`
         id,
         client_name,
+        group_name,
         site_url,
         logo_url,
         assignee,
@@ -208,7 +217,8 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     const monitor = {
       id: site.id,
-      name: site.client_name,
+      // 👇 MODIFIÉ : name = group_name, distinct de clientName plus bas.
+      name: site.group_name || site.client_name,
       type: 'group',
       url: site.site_url,
       hostname: new URL(site.site_url).hostname,
@@ -315,7 +325,7 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     const { data: site } = await supabase
       .from('sites')
-      .select('client_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at, crawl_acknowledged')
+      .select('client_name, group_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at, crawl_acknowledged')
       .eq('id', page.site_id)
       .single();
 
@@ -335,7 +345,9 @@ async function getMonitorDetailFromSupabase(id, type) {
       interval: site?.crawl_interval_minutes ? site.crawl_interval_minutes * 60 : null,
       retryInterval: null,
       parent: page.site_id,
-      parentName: site?.client_name || null,
+      // 👇 MODIFIÉ : parentName = group_name (nom du groupe), distinct de
+      // clientName ci-dessous.
+      parentName: site?.group_name || site?.client_name || null,
       active: page.is_active,
       status,
       msg: latest?.note || null,
@@ -611,7 +623,10 @@ app.post('/create-monitor', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  const { name, url, frequency, assignee } = req.body;
+  // 👇 MODIFIÉ : groupName désormais accepté et stocké séparément de
+  // client_name (name). Fallback sur name si groupName absent, pour
+  // compatibilité avec d'anciens appels client qui ne l'enverraient pas.
+  const { name, groupName, url, frequency, assignee } = req.body;
   if (!name || !url) {
     return res.status(400).json({ error: 'Nom et URL requis.' });
   }
@@ -625,6 +640,7 @@ app.post('/create-monitor', async (req, res) => {
       .from('sites')
       .insert({
         client_name: name,
+        group_name: (groupName && groupName.trim()) || name,
         site_url: url,
         logo_url: logoUrl,
         assignee: assignee || null,
@@ -664,6 +680,114 @@ app.post('/create-monitor', async (req, res) => {
     res.json({ success: true, site });
   } catch (err) {
     console.error('[POST /create-monitor] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 👇 NOUVEAU (route disparue lors de la migration hors de Kuma, réintégrée) :
+// crée un site ET des pages précises fournies par le client — utilisé par
+// AddMonitorScreen quand le scan de pages internes ("Ajouter les urls
+// internes") est activé : contrairement à /create-monitor qui redécouvre
+// lui-même les pages (sitemap puis crawl HTML), ici les pages ont déjà été
+// découvertes côté client via /discover-pages puis sélectionnées à la main
+// (checkboxes) — on ne fait donc AUCUNE redécouverte, on insère exactement
+// ce qui est fourni. Idem pour les endpoints d'API sélectionnés via
+// /discover-apis : surveillés comme des pages normales (pas de colonne
+// "type" dédiée côté schéma pages).
+//
+// Robuste par design : l'échec d'insertion d'UNE page/API n'empêche pas les
+// autres d'être créées (chaque insertion est indépendante, les erreurs sont
+// collectées dans `errors` plutôt que de faire échouer tout le groupe) — le
+// site est déjà créé à ce stade de toute façon, donc un rollback total
+// n'aurait pas de sens sans laisser le site orphelin sans aucune page.
+app.post('/create-monitor-group', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { clientName, groupName, siteUrl, pages, assignee, frequency, apiEndpoints } = req.body;
+  if (!clientName || !siteUrl) {
+    return res.status(400).json({ error: 'clientName et siteUrl requis.' });
+  }
+
+  try {
+    const logoUrl = await getSiteLogoUrl(siteUrl);
+    const intervalHours = parseFrequencyHours(frequency);
+    const crawlIntervalMinutes = intervalHours * 60;
+
+    const { data: site, error: siteError } = await supabase
+      .from('sites')
+      .insert({
+        client_name: clientName,
+        group_name: (groupName && groupName.trim()) || clientName,
+        site_url: siteUrl,
+        logo_url: logoUrl,
+        assignee: assignee || null,
+        is_active: true,
+        crawl_interval_minutes: crawlIntervalMinutes,
+      })
+      .select()
+      .single();
+
+    if (siteError) throw siteError;
+
+    // Pages sélectionnées par l'utilisateur (checkboxes du scan). Si le
+    // tableau est vide (aucune page cochée ou découverte), on se rabat sur
+    // la page d'accueil — même filet de sécurité que /create-monitor.
+    let pagesToInsert = Array.isArray(pages)
+      ? pages.filter((p) => p && typeof p.url === 'string' && p.url.trim().length > 0)
+      : [];
+    if (pagesToInsert.length === 0) {
+      pagesToInsert = [{ url: siteUrl, name: 'Page d\'accueil' }];
+    } else if (!pagesToInsert.some((p) => p.url === siteUrl)) {
+      pagesToInsert = [{ url: siteUrl, name: 'Page d\'accueil' }, ...pagesToInsert];
+    }
+
+    // Endpoints d'API sélectionnés (découverte /discover-apis) — surveillés
+    // comme des pages normales, dans la même table `pages`.
+    const apiPages = Array.isArray(apiEndpoints)
+      ? apiEndpoints
+          .filter((a) => a && typeof a.url === 'string' && a.url.trim().length > 0)
+          .map((a) => ({ url: a.url, name: a.name || a.url }))
+      : [];
+
+    // Dédoublonnage par URL (contrainte unique(site_id,url) côté Supabase) :
+    // une page découverte pourrait coïncider avec un endpoint d'API.
+    const seenUrls = new Set();
+    const allEntries = [];
+    for (const entry of [...pagesToInsert, ...apiPages]) {
+      if (seenUrls.has(entry.url)) continue;
+      seenUrls.add(entry.url);
+      allEntries.push(entry);
+    }
+
+    const created = [];
+    const errors = [];
+
+    for (const entry of allEntries) {
+      const { data: pageRow, error: pageError } = await supabase
+        .from('pages')
+        .insert({
+          site_id: site.id,
+          url: entry.url,
+          name: entry.name || entry.url,
+          is_active: true,
+          discovered_dynamically: false,
+        })
+        .select('id')
+        .single();
+
+      if (pageError) {
+        console.error('[POST /create-monitor-group] Erreur insertion page:', entry.url, pageError);
+        errors.push(`${entry.url}: ${pageError.message}`);
+      } else {
+        created.push(pageRow.id);
+      }
+    }
+
+    res.json({ success: true, groupId: site.id, created, errors });
+  } catch (err) {
+    console.error('[POST /create-monitor-group] Erreur:', err);
     res.status(500).json({ error: err.message });
   }
 });
