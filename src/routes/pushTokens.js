@@ -109,6 +109,54 @@ router.post('/sites/:id/pages-report', async (req, res) => {
   const errors = [];
   let anyDown = false;
 
+  const reportedUrls = [...new Set(
+    pages.map((p) => (typeof p?.url === 'string' ? p.url.trim() : '')).filter(Boolean)
+  )];
+
+  // 👇 OpenClaw devient autoritaire sur la liste des pages : à chaque
+  // patrouille, on supprime toute page du site absente de ce rapport
+  // (page "prévue" initialement via /create-monitor-group mais jamais
+  // retrouvée par OpenClaw, ou doublon de variante d'URL — ex. slash final
+  // différent — puisqu'OpenClaw rapporte alors une URL légèrement
+  // différente qui sera insérée juste après comme nouvelle page). Ça évite
+  // l'accumulation de doublons entre la liste initiale et ce qu'OpenClaw
+  // trouve réellement. page_checks est supprimé en cascade manuellement
+  // avant les pages (pas de ON DELETE CASCADE garanti côté DB), comme le
+  // fait déjà DELETE /monitors/:id dans index.js.
+  const { data: existingPages, error: existingError } = await supabase
+    .from('pages')
+    .select('id, url')
+    .eq('site_id', id);
+
+  if (existingError) {
+    console.error('[pages-report] Erreur lecture pages existantes:', existingError);
+    return res.status(500).json({ success: false, error: 'Erreur lecture pages existantes.' });
+  }
+
+  const staleIds = (existingPages || [])
+    .filter((p) => !reportedUrls.includes(p.url))
+    .map((p) => p.id);
+
+  if (staleIds.length > 0) {
+    const { error: delChecksError } = await supabase
+      .from('page_checks')
+      .delete()
+      .in('page_id', staleIds);
+    if (delChecksError) {
+      console.error('[pages-report] Erreur suppression historique pages obsolètes:', delChecksError);
+      return res.status(500).json({ success: false, error: 'Erreur nettoyage historique pages obsolètes.' });
+    }
+    const { error: delPagesError } = await supabase
+      .from('pages')
+      .delete()
+      .in('id', staleIds);
+    if (delPagesError) {
+      console.error('[pages-report] Erreur suppression pages obsolètes:', delPagesError);
+      return res.status(500).json({ success: false, error: 'Erreur nettoyage pages obsolètes.' });
+    }
+    console.log(`[pages-report] ${staleIds.length} page(s) obsolète(s)/en doublon supprimée(s) pour le site ${id}`);
+  }
+
   for (const p of pages) {
     const url = typeof p?.url === 'string' ? p.url.trim() : '';
     if (!url) {
@@ -185,6 +233,7 @@ router.post('/sites/:id/pages-report', async (req, res) => {
         http_code: Number.isNaN(httpCode) ? null : httpCode,
         note,
         checked_at: checkedAt,
+        source: 'openclaw',
       });
 
     if (checkError) {
