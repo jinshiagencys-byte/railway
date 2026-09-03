@@ -61,14 +61,11 @@ async function buildMonitorsPayloadFromSupabase() {
         url,
         name,
         is_active,
-        page_checks (
-          id,
-          status,
-          http_code,
-          response_time_ms,
-          note,
-          checked_at
-        )
+        last_status,
+        last_http_code,
+        last_response_time_ms,
+        last_note,
+        last_checked_at
       )
     `)
     .eq('is_active', true);
@@ -112,15 +109,14 @@ async function buildMonitorsPayloadFromSupabase() {
     const pages = site.pages || [];
     let anyDown = false;
     pages.forEach((page) => {
-      const checks = page.page_checks || [];
-      const sortedChecks = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
-      const latest = sortedChecks[0] || null;
-
+      // 👇 MODIFIÉ : plus de tri en mémoire sur page_checks — on lit
+      // directement les colonnes dénormalisées last_* maintenues par le
+      // trigger Postgres trg_update_page_last_check (voir migration SQL).
       let status = 'pending';
       if (!page.is_active) {
         status = 'paused';
-      } else if (latest) {
-        const s = latest.status?.toUpperCase();
+      } else if (page.last_status) {
+        const s = page.last_status.toUpperCase();
         if (s === 'UP') status = 'up';
         else if (s === 'DOWN' || s === 'ERROR') { status = 'down'; anyDown = true; }
         else status = 'pending';
@@ -134,10 +130,10 @@ async function buildMonitorsPayloadFromSupabase() {
         parentName: site.client_name,
         active: page.is_active,
         status,
-        msg: latest?.note || null,
-        time: latest?.checked_at || null,
+        msg: page.last_note || null,
+        time: page.last_checked_at || null,
         url: page.url,
-        avgPing: latest?.response_time_ms ?? null,
+        avgPing: page.last_response_time_ms ?? null,
         uptime24h: null,
         logoUrl: site.logo_url,
         sslValidTo: site.ssl_valid_to,
@@ -146,7 +142,7 @@ async function buildMonitorsPayloadFromSupabase() {
         loadTimeMs: site.load_time_ms,
         metricsCheckedAt: site.metrics_checked_at,
         assignee: site.assignee,
-        lastCrawledAt: latest?.checked_at || null,
+        lastCrawledAt: page.last_checked_at || null,
       });
 
       if (status !== 'paused') {
@@ -160,12 +156,12 @@ async function buildMonitorsPayloadFromSupabase() {
     if (groupMonitor) {
       groupMonitor.status = anyDown ? 'down' : (pages.length > 0 ? 'up' : 'pending');
       if (pages.length > 0) {
+        // 👇 MODIFIÉ : plus de tri en mémoire, lecture directe de la colonne
+        // dénormalisée sur la première page.
         const firstPage = pages[0];
-        const checks = firstPage.page_checks || [];
-        const sorted = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
-        if (sorted.length > 0) {
-          groupMonitor.time = sorted[0].checked_at;
-          groupMonitor.msg = sorted[0].note || null;
+        if (firstPage.last_checked_at) {
+          groupMonitor.time = firstPage.last_checked_at;
+          groupMonitor.msg = firstPage.last_note || null;
         }
       }
     }
@@ -198,14 +194,11 @@ async function getMonitorDetailFromSupabase(id, type) {
           url,
           name,
           is_active,
-          page_checks (
-            id,
-            status,
-            http_code,
-            response_time_ms,
-            note,
-            checked_at
-          )
+          last_status,
+          last_http_code,
+          last_response_time_ms,
+          last_note,
+          last_checked_at
         )
       `)
       .eq('id', id)
@@ -245,44 +238,57 @@ async function getMonitorDetailFromSupabase(id, type) {
       crawlAcknowledged: site.crawl_acknowledged,
     };
 
-    const history = [];
     const pages = site.pages || [];
-    let anyDown = false;
-    pages.forEach((page) => {
-      const checks = page.page_checks || [];
-      checks.forEach((check) => {
+    const pageIds = pages.map(p => p.id);
+
+    // 👇 MODIFIÉ : requête à PLAT sur page_checks (1 seul niveau,
+    // filtrée par page_id IN (...)) au lieu de l'embed imbriqué à 2 niveaux
+    // sites → pages → page_checks, dont le tri n'était pas garanti fiable
+    // par PostgREST. order/limit sont fiables ici.
+    let history = [];
+    if (pageIds.length > 0) {
+      const { data: checks, error: checksError } = await supabase
+        .from('page_checks')
+        .select('page_id, status, http_code, response_time_ms, note, checked_at')
+        .in('page_id', pageIds)
+        .order('checked_at', { ascending: false })
+        .limit(200);
+
+      if (checksError) {
+        console.error('[getMonitorDetailFromSupabase] Erreur lecture page_checks:', checksError);
+      } else {
         const statusMap = { 'UP': 'up', 'DOWN': 'down', 'ERROR': 'down', 'UNKNOWN': 'pending' };
-        const status = statusMap[check.status?.toUpperCase()] || 'pending';
-        history.push({
-          status,
+        history = (checks || []).map((check) => ({
+          status: statusMap[check.status?.toUpperCase()] || 'pending',
           time: check.checked_at,
           ping: check.response_time_ms ?? null,
           msg: check.note || `HTTP ${check.http_code ?? '?'}`,
-        });
-        if (status === 'down') anyDown = true;
-      });
-    });
-    history.sort((a, b) => new Date(b.time) - new Date(a.time));
+        }));
+      }
+    }
 
-    monitor.status = anyDown ? 'down' : (history.length > 0 ? 'up' : 'pending');
+    // 👇 MODIFIÉ : anyDown et lastCrawlReport lus depuis les colonnes
+    // dénormalisées last_* plutôt que via un tri en mémoire des page_checks.
+    const anyDown = pages.some(p => p.last_status && ['DOWN', 'ERROR'].includes(p.last_status.toUpperCase()));
+
+    monitor.status = anyDown ? 'down' : (pages.length > 0 ? 'up' : 'pending');
     monitor.lastCheckedAt = history.length > 0 ? history[0].time : null;
     monitor.lastCrawlStatus = anyDown ? 'DOWN' : 'UP';
-    monitor.lastCrawlReport = pages.map(p => {
-      const checks = p.page_checks || [];
-      const sorted = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
-      const latest = sorted[0] || null;
-      return {
-        url: p.url,
-        status: latest?.status?.toUpperCase() || 'UNKNOWN',
-        http_code: latest?.http_code ?? null,
-        action_tested: null,
-        note: latest?.note || null,
-      };
-    });
+    monitor.lastCrawlReport = pages.map(p => ({
+      url: p.url,
+      status: p.last_status?.toUpperCase() || 'UNKNOWN',
+      http_code: p.last_http_code ?? null,
+      action_tested: null,
+      note: p.last_note || null,
+    }));
     monitor.lastCrawledAt = history.length > 0 ? history[0].time : null;
 
     return { monitor, history };
   } else {
+    // Branche "page" individuelle — embed 1 seul niveau (pages →
+    // page_checks), order/limit fiables tels quels ici (contrairement au
+    // 2e niveau utilisé côté groupe). foreignTable renommé referencedTable
+    // (ancien nom déprécié mais toujours fonctionnel en 2.109.0).
     const { data: page, error } = await supabase
       .from('pages')
       .select(`
@@ -301,6 +307,8 @@ async function getMonitorDetailFromSupabase(id, type) {
         )
       `)
       .eq('id', id)
+      .order('checked_at', { referencedTable: 'page_checks', ascending: false })
+      .limit(100, { referencedTable: 'page_checks' })
       .single();
 
     if (error || !page) return null;
@@ -311,8 +319,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       .eq('id', page.site_id)
       .single();
 
-    const checks = page.page_checks || [];
-    const sortedChecks = checks.sort((a, b) => new Date(b.checked_at) - new Date(a.checked_at));
+    const sortedChecks = page.page_checks || [];
     const latest = sortedChecks[0] || null;
 
     const statusMap = { 'UP': 'up', 'DOWN': 'down', 'ERROR': 'down', 'UNKNOWN': 'pending' };
