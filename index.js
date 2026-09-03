@@ -35,6 +35,85 @@ function genPushToken(length = 32) {
 }
 
 // ================================================================
+// UTILITAIRES HTTP & INCIDENTS
+// ================================================================
+
+function getHttpStatusMeaning(code) {
+  const map = {
+    100: 'Continue', 101: 'Switching Protocols', 102: 'Processing', 103: 'Early Hints',
+    200: 'OK', 201: 'Created', 202: 'Accepted', 203: 'Non-Authoritative Information',
+    204: 'No Content', 205: 'Reset Content', 206: 'Partial Content', 207: 'Multi-Status',
+    208: 'Already Reported', 226: 'IM Used',
+    300: 'Multiple Choices', 301: 'Moved Permanently', 302: 'Found', 303: 'See Other',
+    304: 'Not Modified', 305: 'Use Proxy', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
+    400: 'Bad Request', 401: 'Unauthorized', 402: 'Payment Required', 403: 'Forbidden',
+    404: 'Not Found', 405: 'Method Not Allowed', 406: 'Not Acceptable',
+    407: 'Proxy Authentication Required', 408: 'Request Timeout', 409: 'Conflict',
+    410: 'Gone', 411: 'Length Required', 412: 'Precondition Failed',
+    413: 'Payload Too Large', 414: 'URI Too Long', 415: 'Unsupported Media Type',
+    416: 'Range Not Satisfiable', 417: 'Expectation Failed', 418: "I'm a teapot",
+    421: 'Misdirected Request', 422: 'Unprocessable Entity', 423: 'Locked',
+    424: 'Failed Dependency', 425: 'Too Early', 426: 'Upgrade Required',
+    428: 'Precondition Required', 429: 'Too Many Requests',
+    431: 'Request Header Fields Too Large', 451: 'Unavailable For Legal Reasons',
+    500: 'Internal Server Error', 501: 'Not Implemented', 502: 'Bad Gateway',
+    503: 'Service Unavailable', 504: 'Gateway Timeout',
+    505: 'HTTP Version Not Supported', 506: 'Variant Also Negotiates',
+    507: 'Insufficient Storage', 508: 'Loop Detected',
+    510: 'Not Extended', 511: 'Network Authentication Required',
+  };
+  return map[code] || (code ? `HTTP ${code}` : 'Erreur inconnue');
+}
+
+/**
+ * Regroupe les checks consécutifs DOWN/ERROR en incidents.
+ * Retourne les 5 plus récents avec titre (traduction HTTP), date de début, durée en minutes.
+ */
+function computeRecentIncidents(checks) {
+  if (!checks || checks.length === 0) return [];
+
+  const sortedAsc = [...checks].sort((a, b) => new Date(a.checked_at) - new Date(b.checked_at));
+  const rawIncidents = [];
+  let current = null;
+
+  for (const check of sortedAsc) {
+    const isDown = ['DOWN', 'ERROR'].includes(check.status?.toUpperCase());
+    if (isDown) {
+      if (!current) {
+        current = { start: check, end: check, httpCode: check.http_code };
+      } else {
+        current.end = check;
+      }
+    } else {
+      if (current) {
+        rawIncidents.push(current);
+        current = null;
+      }
+    }
+  }
+  if (current) rawIncidents.push(current);
+
+  const lastCheck = sortedAsc[sortedAsc.length - 1];
+  const lastIsDown = lastCheck && ['DOWN', 'ERROR'].includes(lastCheck.status?.toUpperCase());
+  const now = new Date();
+
+  return rawIncidents.reverse().slice(0, 5).map((inc, idx) => {
+    const startDate = new Date(inc.start.checked_at);
+    const isOngoing = idx === 0 && lastIsDown;
+    const endTime = isOngoing ? now.getTime() : new Date(inc.end.checked_at).getTime();
+    const durationMs = endTime - startDate.getTime();
+    const durationMinutes = Math.max(1, Math.round(durationMs / 60000));
+
+    return {
+      title: getHttpStatusMeaning(inc.httpCode),
+      startedAt: inc.start.checked_at,
+      durationMinutes,
+      httpCode: inc.httpCode,
+    };
+  });
+}
+
+// ================================================================
 // LECTURE SUPABASE
 // ================================================================
 
@@ -82,11 +161,6 @@ async function buildMonitorsPayloadFromSupabase() {
   sites.forEach((site) => {
     monitors.push({
       id: site.id,
-      // 👇 MODIFIÉ : name = group_name (nom du groupe), distinct de
-      // client_name désormais stocké séparément (voir clientName plus bas
-      // pour les monitors de type page ; les monitors de type group
-      // n'exposent pas encore clientName dans MonitorItem — seulement
-      // MonitorDetail).
       name: site.group_name || site.client_name,
       type: 'group',
       parent: null,
@@ -106,8 +180,6 @@ async function buildMonitorsPayloadFromSupabase() {
       metricsCheckedAt: site.metrics_checked_at,
       assignee: site.assignee,
       lastCrawledAt: null,
-      // 👇 nouveau : état d'acquittement, utile pour afficher un badge
-      // "en attente de correction" côté app plutôt qu'un simple DOWN
       crawlAcknowledged: site.crawl_acknowledged,
       lastCrawlStatus: site.last_crawl_status,
     });
@@ -115,9 +187,6 @@ async function buildMonitorsPayloadFromSupabase() {
     const pages = site.pages || [];
     let anyDown = false;
     pages.forEach((page) => {
-      // 👇 MODIFIÉ : plus de tri en mémoire sur page_checks — on lit
-      // directement les colonnes dénormalisées last_* maintenues par le
-      // trigger Postgres trg_update_page_last_check (voir migration SQL).
       let status = 'pending';
       if (!page.is_active) {
         status = 'paused';
@@ -133,8 +202,6 @@ async function buildMonitorsPayloadFromSupabase() {
         name: page.name || page.url,
         type: 'http',
         parent: site.id,
-        // 👇 MODIFIÉ : parentName = group_name (nom du groupe parent),
-        // distinct du client_name affiché séparément côté détail.
         parentName: site.group_name || site.client_name,
         active: page.is_active,
         status,
@@ -164,8 +231,6 @@ async function buildMonitorsPayloadFromSupabase() {
     if (groupMonitor) {
       groupMonitor.status = anyDown ? 'down' : (pages.length > 0 ? 'up' : 'pending');
       if (pages.length > 0) {
-        // 👇 MODIFIÉ : plus de tri en mémoire, lecture directe de la colonne
-        // dénormalisée sur la première page.
         const firstPage = pages[0];
         if (firstPage.last_checked_at) {
           groupMonitor.time = firstPage.last_checked_at;
@@ -217,7 +282,6 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     const monitor = {
       id: site.id,
-      // 👇 MODIFIÉ : name = group_name, distinct de clientName plus bas.
       name: site.group_name || site.client_name,
       type: 'group',
       url: site.site_url,
@@ -244,20 +308,18 @@ async function getMonitorDetailFromSupabase(id, type) {
       sslIssuer: site.ssl_issuer,
       loadTimeMs: site.load_time_ms,
       metricsCheckedAt: site.metrics_checked_at,
-      // 👇 nouveau
       crawlAcknowledged: site.crawl_acknowledged,
+      lastHttpCode: null,
+      recentIncidents: [],
     };
 
     const pages = site.pages || [];
     const pageIds = pages.map(p => p.id);
 
-    // 👇 MODIFIÉ : requête à PLAT sur page_checks (1 seul niveau,
-    // filtrée par page_id IN (...)) au lieu de l'embed imbriqué à 2 niveaux
-    // sites → pages → page_checks, dont le tri n'était pas garanti fiable
-    // par PostgREST. order/limit sont fiables ici.
     let history = [];
+    let checks = [];
     if (pageIds.length > 0) {
-      const { data: checks, error: checksError } = await supabase
+      const { data: checksData, error: checksError } = await supabase
         .from('page_checks')
         .select('page_id, status, http_code, response_time_ms, note, checked_at')
         .in('page_id', pageIds)
@@ -267,18 +329,30 @@ async function getMonitorDetailFromSupabase(id, type) {
       if (checksError) {
         console.error('[getMonitorDetailFromSupabase] Erreur lecture page_checks:', checksError);
       } else {
+        checks = checksData || [];
         const statusMap = { 'UP': 'up', 'DOWN': 'down', 'ERROR': 'down', 'UNKNOWN': 'pending' };
-        history = (checks || []).map((check) => ({
+        history = checks.map((check) => ({
           status: statusMap[check.status?.toUpperCase()] || 'pending',
           time: check.checked_at,
           ping: check.response_time_ms ?? null,
-          msg: check.note || `HTTP ${check.http_code ?? '?'}`,
+          msg: check.note || `HTTP ${check.http_code ?? '?' }`,
         }));
       }
     }
 
-    // 👇 MODIFIÉ : anyDown et lastCrawlReport lus depuis les colonnes
-    // dénormalisées last_* plutôt que via un tri en mémoire des page_checks.
+    // Incidents : calcul par page puis merge
+    let allIncidents = [];
+    for (const page of pages) {
+      const pageChecks = checks.filter(c => c.page_id === page.id);
+      const pageIncidents = computeRecentIncidents(pageChecks);
+      allIncidents.push(...pageIncidents);
+    }
+    allIncidents.sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+    monitor.recentIncidents = allIncidents.slice(0, 5);
+
+    // Dernier HTTP code (check le plus récent du groupe)
+    monitor.lastHttpCode = checks.length > 0 ? checks[0].http_code : null;
+
     const anyDown = pages.some(p => p.last_status && ['DOWN', 'ERROR'].includes(p.last_status.toUpperCase()));
 
     monitor.status = anyDown ? 'down' : (pages.length > 0 ? 'up' : 'pending');
@@ -295,10 +369,6 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     return { monitor, history };
   } else {
-    // Branche "page" individuelle — embed 1 seul niveau (pages →
-    // page_checks), order/limit fiables tels quels ici (contrairement au
-    // 2e niveau utilisé côté groupe). foreignTable renommé referencedTable
-    // (ancien nom déprécié mais toujours fonctionnel en 2.109.0).
     const { data: page, error } = await supabase
       .from('pages')
       .select(`
@@ -345,8 +415,6 @@ async function getMonitorDetailFromSupabase(id, type) {
       interval: site?.crawl_interval_minutes ? site.crawl_interval_minutes * 60 : null,
       retryInterval: null,
       parent: page.site_id,
-      // 👇 MODIFIÉ : parentName = group_name (nom du groupe), distinct de
-      // clientName ci-dessous.
       parentName: site?.group_name || site?.client_name || null,
       active: page.is_active,
       status,
@@ -366,13 +434,15 @@ async function getMonitorDetailFromSupabase(id, type) {
       loadTimeMs: site?.load_time_ms || null,
       metricsCheckedAt: site?.metrics_checked_at || null,
       crawlAcknowledged: site?.crawl_acknowledged ?? true,
+      lastHttpCode: latest?.http_code ?? null,
+      recentIncidents: computeRecentIncidents(page.page_checks || []),
     };
 
     const history = sortedChecks.map(c => ({
       status: statusMap[c.status?.toUpperCase()] || 'pending',
       time: c.checked_at,
       ping: c.response_time_ms ?? null,
-      msg: c.note || `HTTP ${c.http_code ?? '?'}`,
+      msg: c.note || `HTTP ${c.http_code ?? '?' }`,
     }));
 
     return { monitor, history };
@@ -383,11 +453,6 @@ async function getMonitorDetailFromSupabase(id, type) {
 // ROUTES
 // ================================================================
 
-// 👇 MODIFIÉ : n'expose plus que les sites actifs ET dont le dernier crawl
-// DOWN a été acquitté (crawl_acknowledged = true). Un site DOWN non acquitté
-// disparaît de cette liste, donc le workflow OpenClaw (fetch-sites) ne le
-// re-testera plus tant qu'un humain n'a pas confirmé le fix via
-// POST /sites/:id/acknowledge.
 app.get('/active-sites', async (req, res) => {
   try {
     const { data: sites, error } = await supabase
@@ -432,9 +497,6 @@ app.get('/monitors/:id', async (req, res) => {
   res.json({ success: true, ...detail });
 });
 
-// 👇 NOUVEAU : pause/reprise réelle. Un site en pause disparaît de
-// /active-sites (filtre is_active déjà en place) donc OpenClaw ne le teste
-// plus. Remplace l'ancienne implémentation Kuma (retirée avec la migration).
 app.post('/monitors/:id/pause', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -469,10 +531,6 @@ app.post('/monitors/:id/resume', async (req, res) => {
   }
 });
 
-// 👇 NOUVEAU : acquittement d'un site DOWN. À appeler depuis l'app quand
-// le dev confirme que le problème a été corrigé — repasse
-// crawl_acknowledged à true, ce qui refait réapparaître le site dans
-// /active-sites au prochain cycle OpenClaw.
 app.post('/sites/:id/acknowledge', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -490,9 +548,6 @@ app.post('/sites/:id/acknowledge', async (req, res) => {
   }
 });
 
-// 👇 NOUVEAU : suppression d'un site — cascade sur ses pages et leurs checks
-// avant de supprimer la ligne `sites` elle-même (pas de ON DELETE CASCADE
-// supposé côté Supabase, donc nettoyage manuel dans l'ordre FK).
 app.delete('/monitors/:id', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -533,9 +588,6 @@ app.delete('/monitors/:id', async (req, res) => {
   }
 });
 
-// 👇 NOUVEAU : pause/reprise/suppression d'une page individuelle, pour le
-// swipe sur un sous-élément dans l'app (n'affecte pas les autres pages du
-// même site ni le site lui-même).
 app.post('/pages/:id/pause', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -618,14 +670,6 @@ function parseFrequencyHours(frequency) {
   return hours;
 }
 
-// 👇 NOUVEAU (route disparue lors de la migration hors de Kuma, réintégrée) :
-// appelée par AddMonitorScreen quand le toggle "Ajouter les urls internes"
-// est activé, AVANT la création du site — sert uniquement à peupler la
-// liste de checkboxes que l'utilisateur sélectionne à la main. Réutilise
-// les mêmes fonctions de découverte (sitemap puis fallback crawl HTML) que
-// /create-monitor, mais ici on renvoie juste la liste au client au lieu de
-// l'insérer directement — l'insertion se fait ensuite via
-// /create-monitor-group avec la sélection finale de l'utilisateur.
 app.post('/discover-pages', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -642,11 +686,6 @@ app.post('/discover-pages', async (req, res) => {
       try {
         discoveredPages = await fetchCrawlFallback(url.trim());
       } catch (_) {
-        // Ni sitemap ni crawl HTML n'ont fonctionné (site protégé, pas de
-        // sitemap, etc.) — on renvoie une liste vide plutôt qu'une erreur :
-        // AddMonitorScreen affiche déjà un message "Aucune page interne
-        // détectée" et autorise la création avec la page d'accueil par
-        // défaut (voir noPagesFound côté client).
         discoveredPages = [];
       }
     }
@@ -662,9 +701,6 @@ app.post('/create-monitor', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  // 👇 MODIFIÉ : groupName désormais accepté et stocké séparément de
-  // client_name (name). Fallback sur name si groupName absent, pour
-  // compatibilité avec d'anciens appels client qui ne l'enverraient pas.
   const { name, groupName, url, frequency, assignee } = req.body;
   if (!name || !url) {
     return res.status(400).json({ error: 'Nom et URL requis.' });
@@ -723,22 +759,6 @@ app.post('/create-monitor', async (req, res) => {
   }
 });
 
-// 👇 NOUVEAU (route disparue lors de la migration hors de Kuma, réintégrée) :
-// crée un site ET des pages précises fournies par le client — utilisé par
-// AddMonitorScreen quand le scan de pages internes ("Ajouter les urls
-// internes") est activé : contrairement à /create-monitor qui redécouvre
-// lui-même les pages (sitemap puis crawl HTML), ici les pages ont déjà été
-// découvertes côté client via /discover-pages puis sélectionnées à la main
-// (checkboxes) — on ne fait donc AUCUNE redécouverte, on insère exactement
-// ce qui est fourni. Idem pour les endpoints d'API sélectionnés via
-// /discover-apis : surveillés comme des pages normales (pas de colonne
-// "type" dédiée côté schéma pages).
-//
-// Robuste par design : l'échec d'insertion d'UNE page/API n'empêche pas les
-// autres d'être créées (chaque insertion est indépendante, les erreurs sont
-// collectées dans `errors` plutôt que de faire échouer tout le groupe) — le
-// site est déjà créé à ce stade de toute façon, donc un rollback total
-// n'aurait pas de sens sans laisser le site orphelin sans aucune page.
 app.post('/create-monitor-group', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -770,9 +790,6 @@ app.post('/create-monitor-group', async (req, res) => {
 
     if (siteError) throw siteError;
 
-    // Pages sélectionnées par l'utilisateur (checkboxes du scan). Si le
-    // tableau est vide (aucune page cochée ou découverte), on se rabat sur
-    // la page d'accueil — même filet de sécurité que /create-monitor.
     let pagesToInsert = Array.isArray(pages)
       ? pages.filter((p) => p && typeof p.url === 'string' && p.url.trim().length > 0)
       : [];
@@ -782,16 +799,12 @@ app.post('/create-monitor-group', async (req, res) => {
       pagesToInsert = [{ url: siteUrl, name: 'Page d\'accueil' }, ...pagesToInsert];
     }
 
-    // Endpoints d'API sélectionnés (découverte /discover-apis) — surveillés
-    // comme des pages normales, dans la même table `pages`.
     const apiPages = Array.isArray(apiEndpoints)
       ? apiEndpoints
           .filter((a) => a && typeof a.url === 'string' && a.url.trim().length > 0)
           .map((a) => ({ url: a.url, name: a.name || a.url }))
       : [];
 
-    // Dédoublonnage par URL (contrainte unique(site_id,url) côté Supabase) :
-    // une page découverte pourrait coïncider avec un endpoint d'API.
     const seenUrls = new Set();
     const allEntries = [];
     for (const entry of [...pagesToInsert, ...apiPages]) {
