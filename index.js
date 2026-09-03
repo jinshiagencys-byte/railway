@@ -618,6 +618,45 @@ function parseFrequencyHours(frequency) {
   return hours;
 }
 
+// 👇 NOUVEAU (route disparue lors de la migration hors de Kuma, réintégrée) :
+// appelée par AddMonitorScreen quand le toggle "Ajouter les urls internes"
+// est activé, AVANT la création du site — sert uniquement à peupler la
+// liste de checkboxes que l'utilisateur sélectionne à la main. Réutilise
+// les mêmes fonctions de découverte (sitemap puis fallback crawl HTML) que
+// /create-monitor, mais ici on renvoie juste la liste au client au lieu de
+// l'insérer directement — l'insertion se fait ensuite via
+// /create-monitor-group avec la sélection finale de l'utilisateur.
+app.post('/discover-pages', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const { url } = req.body;
+  if (!url || typeof url !== 'string' || !url.trim()) {
+    return res.status(400).json({ error: 'URL requise.' });
+  }
+  try {
+    let discoveredPages = [];
+    try {
+      discoveredPages = await fetchSitemapPages(url.trim());
+    } catch (_) {
+      try {
+        discoveredPages = await fetchCrawlFallback(url.trim());
+      } catch (_) {
+        // Ni sitemap ni crawl HTML n'ont fonctionné (site protégé, pas de
+        // sitemap, etc.) — on renvoie une liste vide plutôt qu'une erreur :
+        // AddMonitorScreen affiche déjà un message "Aucune page interne
+        // détectée" et autorise la création avec la page d'accueil par
+        // défaut (voir noPagesFound côté client).
+        discoveredPages = [];
+      }
+    }
+    res.json({ success: true, pages: discoveredPages });
+  } catch (err) {
+    console.error('[POST /discover-pages] Erreur:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/create-monitor', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
