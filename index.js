@@ -581,9 +581,16 @@ app.post('/sites/:id/acknowledge', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
   try {
+    // 👇 CORRIGÉ : On réinitialise le statut en "PENDING" et last_crawled_at à null
+    // pour que le site soit immédiatement éligible au prochain check, et que
+    // l'app mobile affiche un état "En attente" après l'acquittement.
     const { error } = await supabase
       .from('sites')
-      .update({ crawl_acknowledged: true })
+      .update({ 
+        crawl_acknowledged: true,
+        last_crawl_status: 'PENDING',
+        last_crawled_at: null
+      })
       .eq('id', req.params.id);
     if (error) throw error;
 
