@@ -38,6 +38,19 @@ function genPushToken(length = 32) {
 // UTILITAIRES HTTP & INCIDENTS
 // ================================================================
 
+// 👇 Certaines URLs stockées en base peuvent être malformées (ex: espace
+// après "https", saisie manuelle foireuse, etc.). `new URL(...)` lève une
+// exception dans ce cas — sans ce garde-fou, ça fait planter tout le process
+// (voir crash getMonitorDetailFromSupabase / index.js:288 du 2026-09-04).
+function safeHostname(url) {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    return new URL(url.trim()).hostname;
+  } catch {
+    return null;
+  }
+}
+
 function getHttpStatusMeaning(code) {
   const map = {
     100: 'Continue', 101: 'Switching Protocols', 102: 'Processing', 103: 'Early Hints',
@@ -285,7 +298,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       name: site.group_name || site.client_name,
       type: 'group',
       url: site.site_url,
-      hostname: new URL(site.site_url).hostname,
+      hostname: safeHostname(site.site_url),
       port: null,
       interval: site.crawl_interval_minutes ? site.crawl_interval_minutes * 60 : null,
       retryInterval: null,
@@ -410,7 +423,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       name: page.name || page.url,
       type: 'http',
       url: page.url,
-      hostname: new URL(page.url).hostname,
+      hostname: safeHostname(page.url),
       port: null,
       interval: site?.crawl_interval_minutes ? site.crawl_interval_minutes * 60 : null,
       retryInterval: null,
@@ -487,14 +500,22 @@ app.get('/monitors/:id', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
   const id = req.params.id;
-  let detail = await getMonitorDetailFromSupabase(id, 'group');
-  if (!detail) {
-    detail = await getMonitorDetailFromSupabase(id, 'http');
+  try {
+    let detail = await getMonitorDetailFromSupabase(id, 'group');
+    if (!detail) {
+      detail = await getMonitorDetailFromSupabase(id, 'http');
+    }
+    if (!detail) {
+      return res.status(404).json({ error: 'Monitor introuvable.' });
+    }
+    res.json({ success: true, ...detail });
+  } catch (err) {
+    // 👇 Avant : cette route n'avait pas de try/catch — une exception ici
+    // (ex: URL malformée en base) faisait planter tout le process au lieu
+    // de renvoyer une erreur HTTP, causant un crash loop côté Railway.
+    console.error('[GET /monitors/:id] Erreur:', err);
+    res.status(500).json({ error: err.message });
   }
-  if (!detail) {
-    return res.status(404).json({ error: 'Monitor introuvable.' });
-  }
-  res.json({ success: true, ...detail });
 });
 
 app.post('/monitors/:id/pause', async (req, res) => {
