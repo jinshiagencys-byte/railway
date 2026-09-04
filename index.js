@@ -470,12 +470,32 @@ app.get('/active-sites', async (req, res) => {
   try {
     const { data: sites, error } = await supabase
       .from('sites')
-      .select('id, client_name, site_url')
+      .select('id, client_name, site_url, crawl_interval_minutes, last_crawled_at')
       .eq('is_active', true)
       .or('crawl_acknowledged.is.null,crawl_acknowledged.eq.true');
 
     if (error) throw error;
-    res.json({ success: true, sites: sites || [] });
+
+    // 👇 NOUVEAU : avant, /active-sites renvoyait TOUS les sites actifs à
+    // chaque run du cron (toutes les 6h), sans jamais tenir compte de
+    // crawl_interval_minutes (la fréquence choisie par l'utilisateur à la
+    // création du monitor). On ne garde ici que les sites dont l'intervalle
+    // est réellement écoulé depuis last_crawled_at (jamais testé = toujours
+    // dû). Le cron reste le déclencheur (toutes les 6h), mais chaque run ne
+    // teste plus que les sites qui sont vraiment "en retard" par rapport à
+    // leur propre fréquence.
+    const now = Date.now();
+    const due = (sites || []).filter((site) => {
+      if (!site.last_crawled_at) return true;
+      const intervalMs = (site.crawl_interval_minutes || DEFAULT_FREQUENCY_HOURS * 60) * 60 * 1000;
+      const elapsedMs = now - new Date(site.last_crawled_at).getTime();
+      return elapsedMs >= intervalMs;
+    });
+
+    res.json({
+      success: true,
+      sites: due.map(({ id, client_name, site_url }) => ({ id, client_name, site_url })),
+    });
   } catch (err) {
     console.error('[GET /active-sites] Erreur:', err);
     res.status(500).json({ error: err.message });
@@ -717,6 +737,51 @@ app.post('/discover-pages', async (req, res) => {
   }
 });
 
+// 👇 NOUVEAU : déclenche le workflow GitHub Actions OpenClaw juste après la
+// création d'un site, pour ne pas attendre jusqu'à 6h (prochain tick du
+// cron) avant le tout premier check. Comme le site vient d'être créé,
+// last_crawled_at est encore null côté DB, donc le filtre "due" de
+// /active-sites l'inclut automatiquement dès que le workflow tourne — pas
+// besoin de lui passer un input spécifique, il sera testé avec les autres
+// sites éventuellement en retard.
+// Best-effort : nécessite les variables d'env GITHUB_DISPATCH_TOKEN (PAT
+// avec scope "workflow" ou fine-grained "Actions: write" sur le repo) et
+// GITHUB_REPO ("owner/repo"). Si absentes ou si l'appel échoue, on log un
+// warning sans jamais faire échouer la création du monitor.
+const GITHUB_DISPATCH_TOKEN = process.env.GITHUB_DISPATCH_TOKEN || '';
+const GITHUB_REPO = process.env.GITHUB_REPO || '';
+const GITHUB_WORKFLOW_FILE = process.env.GITHUB_WORKFLOW_FILE || 'test-openclaw.yml';
+const GITHUB_WORKFLOW_REF = process.env.GITHUB_WORKFLOW_REF || 'main';
+
+async function triggerOpenClawWorkflow() {
+  if (!GITHUB_DISPATCH_TOKEN || !GITHUB_REPO) {
+    console.warn('[triggerOpenClawWorkflow] GITHUB_DISPATCH_TOKEN/GITHUB_REPO non configurés, check immédiat ignoré.');
+    return;
+  }
+  try {
+    const resp = await fetch(
+      `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${GITHUB_WORKFLOW_FILE}/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${GITHUB_DISPATCH_TOKEN}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ref: GITHUB_WORKFLOW_REF }),
+      }
+    );
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      console.warn(`[triggerOpenClawWorkflow] Échec dispatch (${resp.status}):`, text);
+    } else {
+      console.log('[triggerOpenClawWorkflow] Workflow OpenClaw déclenché avec succès.');
+    }
+  } catch (err) {
+    console.warn('[triggerOpenClawWorkflow] Erreur réseau:', err.message);
+  }
+}
+
 app.post('/create-monitor', async (req, res) => {
   if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -772,6 +837,9 @@ app.post('/create-monitor', async (req, res) => {
         discovered_dynamically: false,
       });
     }
+
+    // Ne bloque pas la réponse si le dispatch échoue/est lent
+    triggerOpenClawWorkflow();
 
     res.json({ success: true, site });
   } catch (err) {
@@ -857,6 +925,9 @@ app.post('/create-monitor-group', async (req, res) => {
         created.push(pageRow.id);
       }
     }
+
+    // Ne bloque pas la réponse si le dispatch échoue/est lent
+    triggerOpenClawWorkflow();
 
     res.json({ success: true, groupId: site.id, created, errors });
   } catch (err) {
