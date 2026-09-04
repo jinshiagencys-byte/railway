@@ -142,6 +142,7 @@ async function buildMonitorsPayloadFromSupabase() {
       assignee,
       is_active,
       crawl_interval_minutes,
+      notification_interval_minutes,
       crawl_acknowledged,
       last_crawl_status,
       ssl_valid_to,
@@ -269,6 +270,7 @@ async function getMonitorDetailFromSupabase(id, type) {
         assignee,
         is_active,
         crawl_interval_minutes,
+        notification_interval_minutes,
         crawl_acknowledged,
         last_crawl_status,
         ssl_valid_to,
@@ -301,6 +303,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       hostname: safeHostname(site.site_url),
       port: null,
       interval: site.crawl_interval_minutes ? site.crawl_interval_minutes * 60 : null,
+      notificationInterval: site.notification_interval_minutes ? site.notification_interval_minutes * 60 : null,
       retryInterval: null,
       parent: null,
       parentName: null,
@@ -408,7 +411,7 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     const { data: site } = await supabase
       .from('sites')
-      .select('client_name, group_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at, crawl_acknowledged')
+      .select('client_name, group_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at, crawl_acknowledged, crawl_interval_minutes, notification_interval_minutes')
       .eq('id', page.site_id)
       .single();
 
@@ -426,6 +429,7 @@ async function getMonitorDetailFromSupabase(id, type) {
       hostname: safeHostname(page.url),
       port: null,
       interval: site?.crawl_interval_minutes ? site.crawl_interval_minutes * 60 : null,
+      notificationInterval: site?.notification_interval_minutes ? site.notification_interval_minutes * 60 : null,
       retryInterval: null,
       parent: page.site_id,
       parentName: site?.group_name || site?.client_name || null,
@@ -787,7 +791,7 @@ app.post('/create-monitor', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  const { name, groupName, url, frequency, assignee } = req.body;
+  const { name, groupName, url, frequency, notificationFrequency, assignee } = req.body;
   if (!name || !url) {
     return res.status(400).json({ error: 'Nom et URL requis.' });
   }
@@ -796,6 +800,8 @@ app.post('/create-monitor', async (req, res) => {
     const logoUrl = await getSiteLogoUrl(url);
     const intervalHours = parseFrequencyHours(frequency);
     const crawlIntervalMinutes = intervalHours * 60;
+    const notificationIntervalHours = parseFrequencyHours(notificationFrequency);
+    const notificationIntervalMinutes = notificationIntervalHours * 60;
 
     const { data: site, error } = await supabase
       .from('sites')
@@ -807,6 +813,7 @@ app.post('/create-monitor', async (req, res) => {
         assignee: assignee || null,
         is_active: true,
         crawl_interval_minutes: crawlIntervalMinutes,
+        notification_interval_minutes: notificationIntervalMinutes,
       })
       .select()
       .single();
@@ -853,7 +860,7 @@ app.post('/create-monitor-group', async (req, res) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  const { clientName, groupName, siteUrl, pages, assignee, frequency, apiEndpoints } = req.body;
+  const { clientName, groupName, siteUrl, pages, assignee, frequency, notificationFrequency, apiEndpoints } = req.body;
   if (!clientName || !siteUrl) {
     return res.status(400).json({ error: 'clientName et siteUrl requis.' });
   }
@@ -862,6 +869,8 @@ app.post('/create-monitor-group', async (req, res) => {
     const logoUrl = await getSiteLogoUrl(siteUrl);
     const intervalHours = parseFrequencyHours(frequency);
     const crawlIntervalMinutes = intervalHours * 60;
+    const notificationIntervalHours = parseFrequencyHours(notificationFrequency);
+    const notificationIntervalMinutes = notificationIntervalHours * 60;
 
     const { data: site, error: siteError } = await supabase
       .from('sites')
@@ -873,6 +882,7 @@ app.post('/create-monitor-group', async (req, res) => {
         assignee: assignee || null,
         is_active: true,
         crawl_interval_minutes: crawlIntervalMinutes,
+        notification_interval_minutes: notificationIntervalMinutes,
       })
       .select()
       .single();
