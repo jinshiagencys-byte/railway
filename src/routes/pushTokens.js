@@ -258,90 +258,14 @@ router.post('/sites/:id/pages-report', async (req, res) => {
   res.json({ success: errors.length === 0, updated: results, errors: errors.length ? errors : undefined });
 });
 
-// 👇 appelée par le script Playwright dédié (SSL + temps de
-// chargement de l'URL principale), lancé AVANT OpenClaw dans le workflow.
-// Remplace ce qu'on tirait auparavant de Kuma pour ces deux métriques.
-// Conservée telle quelle pour la carte "groupe" (MonitorItem/MonitorDetail
-// exposent sslValidTo/loadTimeMs au niveau du site) — voir en plus
-// /sites/:id/pages/update-metrics ci-dessous pour le détail par page.
-router.post('/sites/:id/update-metrics', async (req, res) => {
-  const { id } = req.params;
-  const { sslValidTo, sslDaysRemaining, sslIssuer, loadTimeMs } = req.body || {};
-  const updatePayload = {
-    metrics_checked_at: new Date().toISOString(),
-  };
-  if (sslValidTo !== undefined) updatePayload.ssl_valid_to = sslValidTo;
-  if (sslDaysRemaining !== undefined) updatePayload.ssl_days_remaining = sslDaysRemaining;
-  if (sslIssuer !== undefined) updatePayload.ssl_issuer = sslIssuer;
-  if (loadTimeMs !== undefined) updatePayload.load_time_ms = loadTimeMs;
-  const { error } = await supabase
-    .from('sites')
-    .update(updatePayload)
-    .eq('id', id);
-  if (error) {
-    console.error('[update-metrics] Supabase error:', error);
-    return res.status(500).json({ success: false, error: 'Erreur mise à jour des métriques.' });
-  }
-  res.json({ success: true });
-});
-
-// 👇 métriques SSL + temps de chargement PAR PAGE, appelée par
-// check-metrics.js une fois pour chaque page listée dans pages.json (le
-// rapport structuré produit par OpenClaw après sa patrouille), en plus de
-// la page principale. Upsert par (site_id, url) : si la page existe déjà
-// (créée via /create-monitor-group ou /create-monitor, ou par
-// /pages-report ci-dessus), on met juste à jour ses colonnes métriques ;
-// sinon (page découverte dynamiquement par OpenClaw pendant sa patrouille,
-// absente de la liste initiale), on la crée à la volée avec
-// discovered_dynamically=true, comme le fait déjà /pages-report pour le
-// statut UP/DOWN.
-//
-// Nécessite les colonnes ssl_valid_to / ssl_days_remaining / ssl_issuer /
-// load_time_ms / metrics_checked_at sur la table `pages` (migration SQL à
-// exécuter avant déploiement — mêmes noms que sur `sites`).
-router.post('/sites/:id/pages/update-metrics', async (req, res) => {
-  const { id } = req.params;
-  const { url, sslValidTo, sslDaysRemaining, sslIssuer, loadTimeMs } = req.body || {};
-  if (!url || typeof url !== 'string' || !url.trim()) {
-    return res.status(400).json({ success: false, error: 'url requis.' });
-  }
-
-  const updatePayload = {
-    metrics_checked_at: new Date().toISOString(),
-  };
-  if (sslValidTo !== undefined) updatePayload.ssl_valid_to = sslValidTo;
-  if (sslDaysRemaining !== undefined) updatePayload.ssl_days_remaining = sslDaysRemaining;
-  if (sslIssuer !== undefined) updatePayload.ssl_issuer = sslIssuer;
-  if (loadTimeMs !== undefined) updatePayload.load_time_ms = loadTimeMs;
-
-  const { data: existing, error: findError } = await supabase
-    .from('pages')
-    .select('id')
-    .eq('site_id', id)
-    .eq('url', url)
-    .maybeSingle();
-
-  if (findError) {
-    console.error('[update-page-metrics] Erreur recherche page:', findError);
-    return res.status(500).json({ success: false, error: 'Erreur recherche page.' });
-  }
-
-  const { error } = existing
-    ? await supabase.from('pages').update(updatePayload).eq('id', existing.id)
-    : await supabase.from('pages').insert({
-        site_id: id,
-        url,
-        name: url,
-        is_active: true,
-        discovered_dynamically: true,
-        ...updatePayload,
-      });
-
-  if (error) {
-    console.error('[update-page-metrics] Supabase error:', error);
-    return res.status(500).json({ success: false, error: 'Erreur mise à jour métriques page.' });
-  }
-  res.json({ success: true });
-});
+// 👇 SUPPRIMÉ (2026-09-04) : les deux routes /sites/:id/update-metrics et
+// /sites/:id/pages/update-metrics servaient uniquement au script Playwright
+// dédié (check-metrics.js, SSL + temps de chargement), lancé avant OpenClaw
+// dans le workflow. Ce script est abandonné (métriques non requises pour le
+// projet) — OpenClaw reste seul dans le pipeline et continue d'utiliser
+// Playwright en interne, mais ces deux endpoints n'ont plus d'appelant.
+// sslValidTo/sslDaysRemaining/sslIssuer/loadTimeMs restent lisibles dans
+// MonitorDetail (relayClient.ts) mais ne sont plus jamais mis à jour tant
+// qu'aucun autre appelant n'existe.
 
 module.exports = router;
