@@ -586,6 +586,11 @@ app.post('/sites/:id/acknowledge', async (req, res) => {
       .update({ crawl_acknowledged: true })
       .eq('id', req.params.id);
     if (error) throw error;
+
+    // 👇 NOUVEAU : on déclenche immédiatement un check OpenClaw pour ce site
+    // afin de re-vérifier toutes ses pages dès que l'incident est marqué résolu.
+    triggerOpenClawWorkflow(req.params.id);
+
     res.json({ success: true });
   } catch (err) {
     console.error('[POST /sites/:id/acknowledge] Erreur:', err);
@@ -757,12 +762,21 @@ const GITHUB_REPO = process.env.GITHUB_REPO || '';
 const GITHUB_WORKFLOW_FILE = process.env.GITHUB_WORKFLOW_FILE || 'test-openclaw.yml';
 const GITHUB_WORKFLOW_REF = process.env.GITHUB_WORKFLOW_REF || 'main';
 
-async function triggerOpenClawWorkflow() {
+// 👇 MODIFIÉ : la fonction accepte maintenant un paramètre optionnel `siteId`.
+// Si fourni, on l'ajoute comme input `site_id` au dispatch GitHub, ce qui
+// permet au workflow de cibler uniquement ce site (au lieu de traiter tous
+// les sites dus). Sinon, elle reste utilisée telle quelle pour un déclenchement
+// générique (ex: après création de monitor).
+async function triggerOpenClawWorkflow(siteId) {
   if (!GITHUB_DISPATCH_TOKEN || !GITHUB_REPO) {
     console.warn('[triggerOpenClawWorkflow] GITHUB_DISPATCH_TOKEN/GITHUB_REPO non configurés, check immédiat ignoré.');
     return;
   }
   try {
+    const payload = { ref: GITHUB_WORKFLOW_REF };
+    if (siteId) {
+      payload.inputs = { site_id: String(siteId) };
+    }
     const resp = await fetch(
       `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${GITHUB_WORKFLOW_FILE}/dispatches`,
       {
@@ -772,7 +786,7 @@ async function triggerOpenClawWorkflow() {
           Accept: 'application/vnd.github+json',
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ ref: GITHUB_WORKFLOW_REF }),
+        body: JSON.stringify(payload),
       }
     );
     if (!resp.ok) {
