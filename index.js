@@ -14,7 +14,7 @@ const { getSiteLogoUrl } = require('./src/lib/favicon');
 const discoverApisRoutes = require('./src/routes/discoverApis');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(pushTokensRoutes);
 app.use('/discover-apis', discoverApisRoutes);
 
@@ -356,6 +356,19 @@ async function getMonitorDetailFromSupabase(id, type) {
       }
     }
 
+    const { data: latestQaReport, error: qaReportError } = await supabase
+      .from('crawl_reports')
+      .select('id, status, report, github_run_id, github_run_attempt, github_run_url, finished_at')
+      .eq('site_id', id)
+      .order('finished_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (qaReportError) {
+      console.error('[getMonitorDetailFromSupabase] Erreur lecture crawl_reports:', qaReportError);
+      throw qaReportError;
+    }
+    monitor.qaReport = latestQaReport || null;
+
     // Incidents : calcul par page puis merge
     let allIncidents = [];
     for (const page of pages) {
@@ -503,6 +516,73 @@ app.get('/active-sites', async (req, res) => {
   } catch (err) {
     console.error('[GET /active-sites] Erreur:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/sites/:id/mark-crawled', async (req, res) => {
+  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const siteId = req.params.id;
+  const { status, report, github_run_id, github_run_attempt, github_run_url } = req.body || {};
+  const validStatuses = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+  const runId = Number(github_run_id);
+  const runAttempt = Number(github_run_attempt);
+
+  if (!validStatuses.has(status)) {
+    return res.status(400).json({ error: 'status must be COMPLETED, FAILED, or CANCELLED.' });
+  }
+  if (!report || typeof report !== 'object' || Array.isArray(report)) {
+    return res.status(400).json({ error: 'report must be a JSON object.' });
+  }
+  if (!Number.isSafeInteger(runId) || runId <= 0 ||
+      !Number.isSafeInteger(runAttempt) || runAttempt <= 0) {
+    return res.status(400).json({ error: 'github_run_id and github_run_attempt must be positive integers.' });
+  }
+  if (github_run_url !== undefined &&
+      (typeof github_run_url !== 'string' || !/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/\d+$/.test(github_run_url))) {
+    return res.status(400).json({ error: 'github_run_url must reference a GitHub Actions run.' });
+  }
+
+  try {
+    const { data: site, error: siteLookupError } = await supabase
+      .from('sites')
+      .select('id')
+      .eq('id', siteId)
+      .maybeSingle();
+    if (siteLookupError) throw siteLookupError;
+    if (!site) return res.status(404).json({ error: 'Site introuvable.' });
+
+    const timestamp = new Date().toISOString();
+    const { data: savedReport, error: reportError } = await supabase
+      .from('crawl_reports')
+      .upsert({
+        site_id: siteId,
+        github_run_id: runId,
+        github_run_attempt: runAttempt,
+        github_run_url: github_run_url || null,
+        status,
+        report,
+        finished_at: timestamp,
+      }, { onConflict: 'site_id,github_run_id,github_run_attempt' })
+      .select('id, site_id, status, github_run_id, github_run_attempt, github_run_url, finished_at')
+      .single();
+    if (reportError) throw reportError;
+
+    const { error: siteUpdateError } = await supabase
+      .from('sites')
+      .update({
+        last_crawled_at: timestamp,
+        last_crawl_status: status,
+      })
+      .eq('id', siteId);
+    if (siteUpdateError) throw siteUpdateError;
+
+    return res.json({ success: true, report: savedReport });
+  } catch (err) {
+    console.error('[POST /sites/:id/mark-crawled] Erreur:', err);
+    return res.status(500).json({ error: 'Impossible d’enregistrer le rapport QA.' });
   }
 });
 
