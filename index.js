@@ -150,9 +150,6 @@ async function buildMonitorsPayloadFromSupabase() {
       ssl_issuer,
       load_time_ms,
       metrics_checked_at,
-      video_url,
-      thumbnail_url,
-      video_updated_at,
       pages (
         id,
         url,
@@ -195,9 +192,6 @@ async function buildMonitorsPayloadFromSupabase() {
       sslIssuer: site.ssl_issuer,
       loadTimeMs: site.load_time_ms,
       metricsCheckedAt: site.metrics_checked_at,
-      videoUrl: site.video_url,
-      thumbnailUrl: site.thumbnail_url,
-      videoUpdatedAt: site.video_updated_at,
       assignee: site.assignee,
       lastCrawledAt: null,
       crawlAcknowledged: site.crawl_acknowledged,
@@ -236,9 +230,6 @@ async function buildMonitorsPayloadFromSupabase() {
         sslIssuer: site.ssl_issuer,
         loadTimeMs: site.load_time_ms,
         metricsCheckedAt: site.metrics_checked_at,
-        videoUrl: site.video_url,
-        thumbnailUrl: site.thumbnail_url,
-        videoUpdatedAt: site.video_updated_at,
         assignee: site.assignee,
         lastCrawledAt: page.last_checked_at || null,
       });
@@ -287,9 +278,6 @@ async function getMonitorDetailFromSupabase(id, type) {
         ssl_issuer,
         load_time_ms,
         metrics_checked_at,
-        video_url,
-        thumbnail_url,
-        video_updated_at,
         pages (
           id,
           url,
@@ -336,9 +324,6 @@ async function getMonitorDetailFromSupabase(id, type) {
       sslIssuer: site.ssl_issuer,
       loadTimeMs: site.load_time_ms,
       metricsCheckedAt: site.metrics_checked_at,
-      videoUrl: site.video_url,
-      thumbnailUrl: site.thumbnail_url,
-      videoUpdatedAt: site.video_updated_at,
       crawlAcknowledged: site.crawl_acknowledged,
       lastHttpCode: null,
       recentIncidents: [],
@@ -426,7 +411,7 @@ async function getMonitorDetailFromSupabase(id, type) {
 
     const { data: site } = await supabase
       .from('sites')
-      .select('client_name, group_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at, video_url, thumbnail_url, video_updated_at, crawl_acknowledged, crawl_interval_minutes, notification_interval_minutes')
+      .select('client_name, group_name, site_url, logo_url, assignee, ssl_valid_to, ssl_days_remaining, ssl_issuer, load_time_ms, metrics_checked_at, crawl_acknowledged, crawl_interval_minutes, notification_interval_minutes')
       .eq('id', page.site_id)
       .single();
 
@@ -465,9 +450,6 @@ async function getMonitorDetailFromSupabase(id, type) {
       sslIssuer: site?.ssl_issuer || null,
       loadTimeMs: site?.load_time_ms || null,
       metricsCheckedAt: site?.metrics_checked_at || null,
-      videoUrl: site?.video_url || null,
-      thumbnailUrl: site?.thumbnail_url || null,
-      videoUpdatedAt: site?.video_updated_at || null,
       crawlAcknowledged: site?.crawl_acknowledged ?? true,
       lastHttpCode: latest?.http_code ?? null,
       recentIncidents: computeRecentIncidents(page.page_checks || []),
@@ -619,37 +601,6 @@ app.post('/sites/:id/acknowledge', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('[POST /sites/:id/acknowledge] Erreur:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 👇 NOUVEAU : reçoit video_url/thumbnail_url (déjà uploadés sur Supabase
-// Storage par le workflow GitHub Actions, en dehors de ce relay) et les
-// persiste sur la ligne `sites` correspondante. Une seule vidéo par site
-// (upsert côté Storage sur le même chemin) : cette route écrase donc
-// simplement les colonnes précédentes plutôt que d'accumuler un historique.
-app.post('/sites/:id/attach-video', async (req, res) => {
-  if (req.headers['x-relay-secret'] !== RELAY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  const { video_url, thumbnail_url } = req.body;
-  if (!video_url && !thumbnail_url) {
-    return res.status(400).json({ error: 'video_url ou thumbnail_url requis.' });
-  }
-  try {
-    const update = { video_updated_at: new Date().toISOString() };
-    if (video_url) update.video_url = video_url;
-    if (thumbnail_url) update.thumbnail_url = thumbnail_url;
-
-    const { error } = await supabase
-      .from('sites')
-      .update(update)
-      .eq('id', req.params.id);
-    if (error) throw error;
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[POST /sites/:id/attach-video] Erreur:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -813,9 +764,16 @@ app.post('/discover-pages', async (req, res) => {
 // avec scope "workflow" ou fine-grained "Actions: write" sur le repo) et
 // GITHUB_REPO ("owner/repo"). Si absentes ou si l'appel échoue, on log un
 // warning sans jamais faire échouer la création du monitor.
+//
+// 👇 CORRIGÉ (2026-10-06) : le défaut était 'test-openclaw.yml', un nom de
+// fichier qui n'a jamais existé dans le repo — toute instance sans la
+// variable d'env GITHUB_WORKFLOW_FILE explicitement définie se prenait un
+// 404 silencieux sur /actions/workflows/.../dispatches. Le vrai fichier de
+// workflow s'appelle monitor.yml, donc c'est désormais le défaut, pour ne
+// plus dépendre d'une variable obligatoire à chaque nouveau déploiement.
 const GITHUB_DISPATCH_TOKEN = process.env.GITHUB_DISPATCH_TOKEN || '';
 const GITHUB_REPO = process.env.GITHUB_REPO || '';
-const GITHUB_WORKFLOW_FILE = process.env.GITHUB_WORKFLOW_FILE || 'test-openclaw.yml';
+const GITHUB_WORKFLOW_FILE = process.env.GITHUB_WORKFLOW_FILE || 'monitor.yml';
 const GITHUB_WORKFLOW_REF = process.env.GITHUB_WORKFLOW_REF || 'main';
 
 // 👇 MODIFIÉ : la fonction accepte maintenant un paramètre optionnel `siteId`.
@@ -853,32 +811,6 @@ async function triggerOpenClawWorkflow(siteId) {
     }
   } catch (err) {
     console.warn('[triggerOpenClawWorkflow] Erreur réseau:', err.message);
-  }
-}
-
-// 👇 NOUVEAU : déclenche le workflow GitHub Actions de génération de goals
-// pour un site donné (input `site_id`). Utilise le même token/repo/ref que
-// triggerOpenClawWorkflow. Best-effort : ne fait jamais échouer l'appelant.
-const GITHUB_GOALGEN_WORKFLOW_FILE = process.env.GITHUB_GOALGEN_WORKFLOW_FILE || 'generate-goals.yml';
-
-async function triggerGoalGenWorkflow(siteId) {
-  if (!GITHUB_DISPATCH_TOKEN || !GITHUB_REPO) return;
-  try {
-    const resp = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${GITHUB_GOALGEN_WORKFLOW_FILE}/dispatches`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${GITHUB_DISPATCH_TOKEN}`,
-          Accept: 'application/vnd.github+json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ ref: GITHUB_WORKFLOW_REF, inputs: { site_id: String(siteId) } }),
-      }
-    );
-    if (!resp.ok) console.warn('[triggerGoalGenWorkflow] dispatch failed:', resp.status, await resp.text().catch(() => ''));
-  } catch (err) {
-    console.warn('[triggerGoalGenWorkflow]', err.message);
   }
 }
 
@@ -943,7 +875,6 @@ app.post('/create-monitor', async (req, res) => {
 
     // Ne bloque pas la réponse si le dispatch échoue/est lent
     triggerOpenClawWorkflow();
-    triggerGoalGenWorkflow(site.id);
 
     res.json({ success: true, site });
   } catch (err) {
@@ -1035,7 +966,6 @@ app.post('/create-monitor-group', async (req, res) => {
 
     // Ne bloque pas la réponse si le dispatch échoue/est lent
     triggerOpenClawWorkflow();
-    triggerGoalGenWorkflow(site.id);
 
     res.json({ success: true, groupId: site.id, created, errors });
   } catch (err) {
