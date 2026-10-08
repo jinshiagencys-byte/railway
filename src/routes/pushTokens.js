@@ -47,33 +47,6 @@ router.get('/push-tokens', async (req, res) => {
 // automatiquement : si le site était déjà en pause d'acquittement, aucun
 // nouveau check ne peut arriver avant l'acquittement — c'est l'acquittement
 // lui-même qui doit réactiver les checks.
-router.post('/sites/:id/mark-crawled', async (req, res) => {
-  const { id } = req.params;
-  const { status, message } = req.body || {};
-  const updatePayload = {
-    last_crawled_at: new Date().toISOString(),
-  };
-  const normalizedStatus = typeof status === 'string' ? status.toUpperCase() : null;
-  if (normalizedStatus) {
-    updatePayload.last_crawl_status = normalizedStatus;
-  }
-  if (message !== undefined) {
-    updatePayload.last_crawl_report = message;
-  }
-  if (normalizedStatus === 'DOWN' || normalizedStatus === 'ERROR') {
-    updatePayload.crawl_acknowledged = false;
-  }
-  const { error } = await supabase
-    .from('sites')
-    .update(updatePayload)
-    .eq('id', id);
-  if (error) {
-    console.error('[mark-crawled] Supabase error:', error);
-    return res.status(500).json({ success: false, error: 'Erreur mise à jour last_crawled_at.' });
-  }
-  res.json({ success: true });
-});
-
 // 👇 NOUVEAU : route appelée par le workflow OpenClaw juste après
 // "mark-crawled", avec le détail structuré par page produit par l'agent
 // (bloc JSON `{ pages: [...] }` extrait de task.md). C'est cette route qui
